@@ -1,0 +1,16 @@
+set stty_init "rows 24 columns 80"
+set timeout 10
+spawn env PATH=[pwd]/tests/fake-ssh:$env(PATH) ./target/debug/term-scp -l /tmp fake:/tmp
+expect_after {
+    timeout { puts "\nsmoke: timeout"; exit 1 }
+    eof     { puts "\nsmoke: early eof"; exit 1 }
+}
+expect "local:"
+expect "fake:/"
+send "\t"
+send "q"
+expect {
+    eof {}
+}
+lassign [wait] pid spawnid os_error value
+exit $value

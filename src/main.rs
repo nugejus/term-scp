@@ -1,4 +1,3 @@
-#![allow(dead_code)] // ponytail: until Task 10 wires main
 mod controller;
 mod fs;
 mod icons;
@@ -6,6 +5,15 @@ mod model;
 mod transfer;
 mod view;
 use clap::Parser;
+use controller::{AppEvent, Controller};
+use fs::{Fs, Remote, SshOpts, sftp_err};
+use model::{App, Pane, Side};
+use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture};
+use ratatui::crossterm::execute;
+use std::io::stdout;
+use std::process::ExitCode;
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(version, about = "Two-pane local | remote SFTP terminal tool")]
@@ -60,8 +68,92 @@ fn remote_start(path: &str) -> String {
     }
 }
 
-fn main() {
-    let _cli = Cli::parse();
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err((code, msg)) => {
+            eprintln!("{msg}");
+            ExitCode::from(code)
+        }
+    }
+}
+
+/// Errors return (never `exit`), so `Drop for Remote` kills ssh and removes the control dir.
+fn run() -> Result<(), (u8, String)> {
+    let cli = Cli::parse();
+    let t = parse_target(&cli.target).map_err(|e| (2, format!("term-scp: {e}")))?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| (1, format!("term-scp: {e}")))?;
+    let opts = SshOpts {
+        port: cli.port,
+        identity: cli.identity,
+        options: cli.ssh_option,
+    };
+    // Before raw mode: ssh's password, passphrase and host-key prompts need a normal terminal.
+    let remote = rt
+        .block_on(Remote::connect_ssh(&t.host, &opts))
+        .map_err(|e| (1, format!("term-scp: cannot connect to {}:\n{e}", t.host)))?;
+    let remote_cwd = rt
+        .block_on(remote.sftp.canonicalize(remote_start(&t.path)))
+        .map_err(|e| {
+            (
+                1,
+                format!("term-scp: {}:{}: {}", t.host, t.path, sftp_err(e)),
+            )
+        })?;
+    let dir = cli.local.unwrap_or_else(|| ".".into());
+    let local = std::fs::canonicalize(&dir)
+        .map_err(|e| (1, format!("term-scp: {dir}: {e}")))?
+        .to_string_lossy() // ponytail: lossy non-UTF-8 local names
+        .into_owned();
+
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(stdout(), DisableMouseCapture);
+        hook(info);
+    }));
+    let mut terminal = ratatui::init();
+    let _ = execute!(stdout(), EnableMouseCapture);
+
+    let (tx, rx) = mpsc::channel();
+    let input = tx.clone();
+    std::thread::spawn(move || {
+        while let Ok(e) = event::read() {
+            if input.send(AppEvent::Input(e)).is_err() {
+                break;
+            }
+        }
+    });
+
+    let left = Pane::new(Fs::Local, local.clone());
+    let right = Pane::new(Fs::Remote(Arc::new(remote)), remote_cwd.clone());
+    let mut app = App::new(left, right, !cli.no_icons);
+    let mut ctl = Controller::new(rt.handle().clone(), tx);
+    ctl.load(&mut app, Side::Left, local, None);
+    ctl.load(&mut app, Side::Right, remote_cwd, None);
+
+    while !app.quit {
+        if terminal.draw(|f| view::draw(f, &mut app)).is_err() {
+            break; // the terminal is gone
+        }
+        if let Ok(ev) = rx.recv_timeout(Duration::from_millis(100)) {
+            ctl.handle(&mut app, ev);
+            for ev in rx.try_iter() {
+                ctl.handle(&mut app, ev);
+            }
+        }
+        // Every iteration: progress events alone would starve a timeout-only tick.
+        ctl.tick(&mut app, Instant::now());
+    }
+
+    let _ = execute!(stdout(), DisableMouseCapture);
+    ratatui::restore();
+    {
+        let _g = rt.enter();
+        drop(app);
+        drop(ctl);
+    }
+    rt.shutdown_background();
+    Ok(())
 }
 
 #[cfg(test)]

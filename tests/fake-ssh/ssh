@@ -1,0 +1,5 @@
+#!/bin/sh
+for p in /usr/libexec/sftp-server /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server /usr/lib/ssh/sftp-server; do
+  [ -x "$p" ] && exec "$p"
+done
+echo 'fake-ssh: no sftp-server' >&2; exit 127
