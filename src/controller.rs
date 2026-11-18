@@ -217,6 +217,8 @@ impl Controller {
                 }
             }
             None => {
+                // A message stays until the next key; whatever this key causes sets its own.
+                app.status.clear();
                 if let Some(cmd) = key_to_command(k) {
                     self.apply(app, cmd);
                 }
@@ -979,6 +981,14 @@ mod tests {
         press(&mut t, KeyCode::Char('q'));
         press(&mut t, KeyCode::Char('y'));
         assert!(t.app.quit);
+    }
+
+    #[test]
+    fn key_clears_status() {
+        let mut t = setup(&["a"], &[]);
+        t.app.status = "boom".into();
+        press(&mut t, KeyCode::Down);
+        assert_eq!(t.app.status, "");
     }
 
     #[test]
