@@ -152,7 +152,8 @@ fn run() -> Result<(), (u8, String)> {
         drop(app);
         drop(ctl);
     }
-    rt.shutdown_background();
+    // Drops in-flight tasks, and with them their `Arc<Remote>`s: `Drop for Remote` removes the control dir.
+    rt.shutdown_timeout(Duration::from_secs(1));
     Ok(())
 }
 
