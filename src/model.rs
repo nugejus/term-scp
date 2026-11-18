@@ -117,6 +117,9 @@ impl Pane {
     }
 
     pub fn move_cursor(&mut self, delta: isize, extend: bool) {
+        if self.entries.is_empty() {
+            return;
+        }
         let last = self.entries.len().saturating_sub(1) as isize;
         let new = (self.cursor as isize + delta).clamp(0, last) as usize;
         if !extend {
@@ -415,5 +418,16 @@ mod tests {
         t.jobs.remove(&1);
         t.sample(t0 + Duration::from_secs(2));
         assert_eq!(t.speed, 500_000.0);
+    }
+
+    #[test]
+    fn empty_pane_movement_does_not_panic() {
+        let mut p = Pane::new(Fs::Local, "/".into());
+        p.move_cursor(1, true);
+        p.move_cursor(-1, true);
+        p.move_cursor(1, false);
+        p.cursor_to(5);
+        assert!(p.current().is_none());
+        assert!(p.selection().is_empty());
     }
 }
