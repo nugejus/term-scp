@@ -2,6 +2,10 @@
 
 Two-pane file manager for the terminal: your machine on the left, an SSH host on the right, or two SSH hosts side by side. Copy and move files between them. On a window taller than it is wide, the panes stack: left on top, right below.
 
+<p align="center">
+  <img src="docs/screenshots/main.png" width="860" alt="term-scp: the local folder on the left with three files marked, the web server's folder on the right, and a 6 GB archive copying at 946 MB/s in the toolbar">
+</p>
+
 ## Prerequisites
 
 - macOS or Linux
@@ -89,6 +93,10 @@ The toolbar buttons do what their keys do. Everything is also clickable; double-
 
 Right-click a file for a menu: copy, copy to, move, rename, delete, new folder, new file, change folder and filter, each with its key beside it. It acts on that file, or on all marked files when it is one of them. Pick with the mouse, `↑` `↓` `Enter` or the key; `Esc` or a click elsewhere closes it. Some terminals keep right-click for their own menu; turn that off to get this one.
 
+<p align="center">
+  <img src="docs/screenshots/menu.png" width="760" alt="The right-click menu open over two marked files, listing Copy, Copy to, Move to, Rename, Delete, New dir, New file, Change dir and Filter, each with its key">
+</p>
+
 ## Copy to and Move
 
 `Shift` `C` and `m` open a line with the destination filled in: `<other pane's folder>/<name>` for one file, the other pane's folder for several. The box is a third of the screen wide; a long path wraps.
@@ -119,6 +127,17 @@ When a file is already there, you are asked:
   - `Esc` in the bar clears it, and so does opening another folder.
   - Marks on files the filter hides are dropped, so a copy or delete only takes what you see.
 - The number you type before `↑` / `↓` shows in the bottom line; any other key drops it.
+
+<table>
+  <tr>
+    <td align="center" width="60%"><img src="docs/screenshots/filter.png" alt="The filter bar on top of the server pane: typing backup leaves the three backup archives"></td>
+    <td align="center" width="40%"><img src="docs/screenshots/stacked.png" alt="A tall window: the local pane on top, the server pane below"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><code>f</code> then <code>backup</code>: the list narrows as you type</sub></td>
+    <td align="center"><sub>A tall window stacks the panes</sub></td>
+  </tr>
+</table>
 
 ## Transfers
 
