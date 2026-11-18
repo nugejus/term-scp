@@ -28,7 +28,7 @@ pub enum AppEvent {
     Transfer(TransferEvent),
 }
 
-/// The Key table. Letters match regardless of SHIFT; Ctrl+letter is only Ctrl+R.
+/// The Key table. Letters match regardless of SHIFT; Ctrl+letter is only Ctrl+R and Ctrl+C.
 pub fn key_to_command(k: KeyEvent) -> Option<Command> {
     use Command::*;
     if k.kind != KeyEventKind::Press {
@@ -50,6 +50,7 @@ pub fn key_to_command(k: KeyEvent) -> Option<Command> {
         KeyCode::Tab | KeyCode::BackTab => SwitchPane,
         KeyCode::Esc => ClearMarks,
         KeyCode::Char('r') if ctrl => Refresh,
+        KeyCode::Char('c') if ctrl => Quit,
         KeyCode::Char(_) if ctrl => return None,
         KeyCode::Char('c') => QuickCopy,
         KeyCode::Char('C') => CopyTo,
@@ -203,7 +204,7 @@ impl Controller {
                 });
             }
             Some(Popup::Help) => {}
-            Some(Popup::ConfirmQuit) => app.quit = k.code == KeyCode::Char('y'),
+            Some(Popup::ConfirmQuit) => app.quit = matches!(k.code, KeyCode::Char('y' | 'Y')),
             None if !app.conflicts.is_empty() => {
                 let r = match k.code {
                     KeyCode::Char('o') => Resolution::Overwrite,
@@ -692,6 +693,7 @@ mod tests {
             (K::Char('?'), shift, Help),
             (K::Char('r'), KeyModifiers::CONTROL, Refresh),
             (K::Char('q'), none, Quit),
+            (K::Char('c'), KeyModifiers::CONTROL, Quit),
         ];
         for (code, m, cmd) in rows {
             assert_eq!(
@@ -703,8 +705,8 @@ mod tests {
         let mut release = KeyEvent::new(K::Char('q'), none);
         release.kind = KeyEventKind::Release;
         assert_eq!(key_to_command(release), None);
-        let ctrl_c = KeyEvent::new(K::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(key_to_command(ctrl_c), None);
+        let ctrl_x = KeyEvent::new(K::Char('x'), KeyModifiers::CONTROL);
+        assert_eq!(key_to_command(ctrl_x), None);
     }
 
     #[test]
@@ -980,6 +982,11 @@ mod tests {
         assert!(!t.app.quit);
         press(&mut t, KeyCode::Char('q'));
         press(&mut t, KeyCode::Char('y'));
+        assert!(t.app.quit);
+        t.app.quit = false;
+        press_mod(&mut t, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(matches!(t.app.popup, Some(Popup::ConfirmQuit)));
+        press_mod(&mut t, KeyCode::Char('Y'), KeyModifiers::SHIFT);
         assert!(t.app.quit);
     }
 

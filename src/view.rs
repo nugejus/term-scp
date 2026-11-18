@@ -11,7 +11,7 @@ use ratatui::widgets::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// The Key table from Global Constraints: (key, help text).
-const HELP: [(&str, &str); 16] = [
+const HELP: [(&str, &str); 17] = [
     ("↑ / ↓", "Move cursor"),
     ("Shift+↑ / Shift+↓", "Select range"),
     ("PgUp / PgDn / Home / End", "Page / first / last"),
@@ -28,6 +28,7 @@ const HELP: [(&str, &str); 16] = [
     ("?", "Help"),
     ("Ctrl+R", "Refresh"),
     ("q", "Quit"),
+    ("Ctrl+C", "Quit"),
 ];
 
 pub fn draw(f: &mut Frame, app: &mut App) {

@@ -719,7 +719,9 @@ mod tests {
         ]
         .into_iter()
         .chain(G)
-        .chain(["-p", "2222", "-i", "k", "-o", "A=b", "-s", "--", "h", "sftp"])
+        .chain([
+            "-p", "2222", "-i", "k", "-o", "A=b", "-s", "--", "h", "sftp",
+        ])
         .collect();
         assert_eq!(ssh_argv("h", &o, "/tmp/c", true), want);
         let none = SshOpts {
