@@ -207,17 +207,18 @@ impl Controller {
         }
     }
 
-    /// Enter in an Input popup (already closed).
+    /// Enter in an Input popup (already closed). Acts on the dir captured at open,
+    /// never on the pane's cwd now: a listing may have landed meanwhile.
     fn confirm(&mut self, app: &mut App, kind: InputKind, value: String) {
-        let side = app.focus;
-        let p = &app.panes[side.idx()];
+        let side = app.focus; // focus cannot change while a popup is open
+        let fs = app.panes[side.idx()].fs.clone();
+        let mk = matches!(kind, InputKind::NewDir { .. });
         match kind {
-            InputKind::NewDir | InputKind::NewFile if value.is_empty() => {}
-            InputKind::NewDir | InputKind::NewFile => {
-                let (fs, path, tx) = (p.fs.clone(), join(&p.cwd, &value), self.tx.clone());
-                let dir = matches!(kind, InputKind::NewDir);
+            InputKind::NewDir { .. } | InputKind::NewFile { .. } if value.is_empty() => {}
+            InputKind::NewDir { dir } | InputKind::NewFile { dir } => {
+                let (path, tx) = (join(&dir, &value), self.tx.clone());
                 self.rt.spawn(async move {
-                    let result = match dir {
+                    let result = match mk {
                         true => fs.mkdir(&path).await,
                         false => fs.create_new(&path).await,
                     };
@@ -229,15 +230,21 @@ impl Controller {
                     });
                 });
             }
-            InputKind::ChangeDir => {
-                let path = resolve_path(&value, &p.cwd, &p.fs.home());
+            InputKind::ChangeDir { base } => {
+                let path = resolve_path(&value, &base, &fs.home());
                 self.load(app, side, path, None);
             }
             // An emptied field would resolve to the other cwd and merge a dir into it.
             InputKind::CopyTo { .. } if value.trim().is_empty() => {}
-            InputKind::CopyTo { from, items, mv } => {
-                let (src, dst) = (&app.panes[from.idx()], &app.panes[from.other().idx()]);
-                let targets = copy_targets(&items, &src.cwd, &value, &dst.cwd, &dst.fs.home());
+            InputKind::CopyTo {
+                from,
+                items,
+                mv,
+                src_cwd,
+            } => {
+                // The prefilled value is absolute, so the other pane's cwd now is fine here.
+                let dst = &app.panes[from.other().idx()];
+                let targets = copy_targets(&items, &src_cwd, &value, &dst.cwd, &dst.fs.home());
                 self.submit_copy(app, from, targets, mv);
             }
         }
@@ -287,14 +294,29 @@ impl Controller {
                         [one] => join(dst, &one.name),
                         _ => dst.clone(),
                     };
-                    let (mv, from) = (cmd == Move, side);
+                    let (mv, from, src_cwd) = (cmd == Move, side, src);
+                    let kind = InputKind::CopyTo {
+                        from,
+                        items,
+                        mv,
+                        src_cwd,
+                    };
                     let title = if mv { "Move to" } else { "Copy to" };
-                    app.popup = input(InputKind::CopyTo { from, items, mv }, title, value);
+                    app.popup = input(kind, title, value);
                 }
             }
-            NewDir => app.popup = input(InputKind::NewDir, "New Dir", String::new()),
-            NewFile => app.popup = input(InputKind::NewFile, "New File", String::new()),
-            ChangeDir => app.popup = input(InputKind::ChangeDir, "Change Dir", p.cwd.clone()),
+            NewDir => {
+                let kind = InputKind::NewDir { dir: p.cwd.clone() };
+                app.popup = input(kind, "New Dir", String::new());
+            }
+            NewFile => {
+                let kind = InputKind::NewFile { dir: p.cwd.clone() };
+                app.popup = input(kind, "New File", String::new());
+            }
+            ChangeDir => {
+                let base = p.cwd.clone();
+                app.popup = input(InputKind::ChangeDir { base }, "Change Dir", p.cwd.clone());
+            }
             Help => app.popup = Some(Popup::Help),
             Refresh => self.reload(app, side),
             Quit if app.transfers.jobs.is_empty() => app.quit = true,
@@ -379,10 +401,13 @@ impl Controller {
                 app.conflicts.push_back(ConflictPrompt { job, path, reply });
             }
             TransferEvent::ItemError { id, path, error } => {
-                app.status = match error.starts_with(&path) {
+                let msg = match error.starts_with(&path) {
                     true => format!("Job {id}: {error}"),
                     false => format!("Job {id}: {path}: {error}"),
                 };
+                // Kept for Finished, which replaces the status in the same batch.
+                t.jobs.entry(id).or_default().last_error = Some(msg.clone());
+                app.status = msg;
             }
             TransferEvent::Finished {
                 id,
@@ -392,7 +417,7 @@ impl Controller {
                 cancelled,
                 mv,
             } => {
-                t.jobs.remove(&id);
+                let last_error = t.jobs.remove(&id).and_then(|j| j.last_error);
                 let verb = if mv { "Moved" } else { "Copied" };
                 let mut s = format!("{verb} {copied} item(s)");
                 if failed > 0 {
@@ -403,6 +428,10 @@ impl Controller {
                 }
                 if cancelled {
                     s += " (cancelled)";
+                }
+                // Every ItemError counts as failed, so this only shows when failed > 0.
+                if let Some(e) = last_error {
+                    s += &format!(" — {e}");
                 }
                 app.status = s;
                 self.reload(app, Side::Left);
@@ -726,6 +755,55 @@ mod tests {
         assert!(t.app.popup.is_none());
         assert!(t.app.transfers.jobs.is_empty());
         assert!(std::path::Path::new(&join(&t.dirs[0], "d/x")).exists());
+    }
+
+    #[test]
+    fn copy_to_uses_cwd_captured_at_open() {
+        let mut t = setup(&["x", "sub/", "sub/x"], &[]);
+        let (a, sub) = (t.dirs[0].clone(), join(&t.dirs[0], "sub"));
+        select(&mut t, "x");
+        press(&mut t, KeyCode::Char('m'));
+        let landed = AppEvent::Listed {
+            side: Left,
+            seq: t.app.panes[0].seq,
+            select: None,
+            result: Ok((sub.clone(), vec![file("x")])),
+        };
+        t.ctl.handle(&mut t.app, landed);
+        assert_eq!(t.app.panes[0].cwd, sub);
+        press(&mut t, KeyCode::Enter);
+        pump(&mut t, |a| lists(a, Right, &["x"]));
+        let exists = |p: String| std::path::Path::new(&p).exists();
+        assert!(!exists(join(&a, "x")));
+        assert!(exists(join(&t.dirs[1], "x")));
+        assert!(exists(join(&sub, "x")));
+    }
+
+    #[test]
+    fn finished_keeps_last_item_error() {
+        let mut t = setup(&[], &[]);
+        let (id, path) = (9, "/p/f".to_string());
+        let error = "/p/f: Permission denied".to_string();
+        for ev in [
+            TransferEvent::Queued { id },
+            TransferEvent::Started { id },
+            TransferEvent::ItemError { id, path, error },
+            TransferEvent::Finished {
+                id,
+                copied: 0,
+                skipped: 0,
+                failed: 1,
+                cancelled: false,
+                mv: false,
+            },
+        ] {
+            t.ctl.handle(&mut t.app, AppEvent::Transfer(ev));
+        }
+        let s = &t.app.status;
+        assert!(
+            s.contains("1 failed") && s.contains("Permission denied"),
+            "{s}"
+        );
     }
 
     #[test]

@@ -174,14 +174,22 @@ impl Pane {
     }
 }
 
+/// Each kind captures, at open time, the dir it acts on.
 pub enum InputKind {
-    NewDir,
-    NewFile,
-    ChangeDir,
+    NewDir {
+        dir: String,
+    },
+    NewFile {
+        dir: String,
+    },
+    ChangeDir {
+        base: String,
+    },
     CopyTo {
         from: Side,
         items: Vec<Entry>,
         mv: bool,
+        src_cwd: String,
     },
 }
 pub enum Popup {
@@ -208,6 +216,7 @@ pub struct JobProgress {
     pub total_bytes: u64,
     pub done_files: usize,
     pub total_files: usize,
+    pub last_error: Option<String>,
 }
 
 #[derive(Default)]

@@ -400,6 +400,7 @@ mod tests {
             total_bytes: 100,
             done_files: 1,
             total_files: 2,
+            last_error: None,
         }
     }
 
@@ -552,7 +553,7 @@ mod tests {
                     2 => a.popup = Some(Popup::Help),
                     3 => {
                         a.popup = Some(Popup::Input {
-                            kind: InputKind::NewDir,
+                            kind: InputKind::NewDir { dir: "/".into() },
                             title: "New dir".into(),
                             value: "v".repeat(50),
                             cursor: 50,
