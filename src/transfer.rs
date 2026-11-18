@@ -288,6 +288,8 @@ pub async fn run_job(job: Job, emit: Emit) {
         match op {
             Op::Dir { dst: d } => {
                 if broken.as_deref().is_some_and(|b| under(&d, b)) {
+                    // Never created: its own DirDone must not remove the source.
+                    kept.push(d);
                     continue;
                 }
                 let r = match dst.stat(&d).await {
@@ -1008,6 +1010,28 @@ mod tests {
                 "shared"
             );
             assert!(!exists(&sd));
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn move_keeps_dirs_under_broken_destination() {
+        guarded(async {
+            let (_a, s) = tmp();
+            let (_b, d) = tmp();
+            let sd = join(&s, "d");
+            std::fs::create_dir_all(join(&sd, "sub/empty")).unwrap();
+            std::fs::create_dir(join(&s, "t")).unwrap();
+            std::os::unix::fs::symlink("../../t", join(&sd, "sub/l")).unwrap();
+            std::fs::create_dir(join(&d, "d")).unwrap();
+            std::fs::write(join(&d, "d/sub"), "file").unwrap();
+            let items = [(sd.clone(), join(&d, "d"))];
+            let log = run(Fs::Local, test_remote().await, &items, true, Skip).await;
+            assert!(ev(&log, "ItemError").contains("not a directory"), "{log:?}");
+            assert!(ev(&log, "Finished").contains("failed: 1,"), "{log:?}");
+            assert!(std::fs::metadata(join(&sd, "sub/empty")).unwrap().is_dir());
+            assert!(exists(&join(&sd, "sub/l")));
+            assert_eq!(std::fs::read_to_string(join(&d, "d/sub")).unwrap(), "file");
         })
         .await
     }
