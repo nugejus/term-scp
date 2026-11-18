@@ -143,9 +143,13 @@ impl Controller {
                     Ok((cwd, entries)) => p.set_listing(cwd, entries, select.as_deref()),
                     Err(e) => {
                         p.loading = None;
-                        app.status = match &p.fs {
-                            Fs::Remote(r) if !r.alive() => format!("{e} — {}", r.stderr_tail()),
-                            _ => e,
+                        let tail = match &p.fs {
+                            Fs::Remote(r) if !r.alive() => r.stderr_tail(),
+                            _ => String::new(),
+                        };
+                        app.status = match tail.is_empty() {
+                            true => e,
+                            false => format!("{e} — {tail}"),
                         };
                     }
                 }
