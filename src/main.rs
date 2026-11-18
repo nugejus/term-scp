@@ -82,6 +82,12 @@ fn main() -> ExitCode {
 fn run() -> Result<(), (u8, String)> {
     let cli = Cli::parse();
     let t = parse_target(&cli.target).map_err(|e| (2, format!("term-scp: {e}")))?;
+    // Before connecting: a bad -l must fail without an ssh login.
+    let dir = cli.local.unwrap_or_else(|| ".".into());
+    let local = std::fs::canonicalize(&dir)
+        .map_err(|e| (1, format!("term-scp: {dir}: {e}")))?
+        .to_string_lossy() // ponytail: lossy non-UTF-8 local names
+        .into_owned();
     let rt = tokio::runtime::Runtime::new().map_err(|e| (1, format!("term-scp: {e}")))?;
     let opts = SshOpts {
         port: cli.port,
@@ -100,11 +106,6 @@ fn run() -> Result<(), (u8, String)> {
                 format!("term-scp: {}:{}: {}", t.host, t.path, sftp_err(e)),
             )
         })?;
-    let dir = cli.local.unwrap_or_else(|| ".".into());
-    let local = std::fs::canonicalize(&dir)
-        .map_err(|e| (1, format!("term-scp: {dir}: {e}")))?
-        .to_string_lossy() // ponytail: lossy non-UTF-8 local names
-        .into_owned();
 
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
