@@ -129,7 +129,14 @@ impl Fs {
                     let full = join(&canon, &name);
                     match local_meta(&full).await {
                         Ok(m) => v.push(entry(name, &m)),
-                        Err(e) => return Err(err(&full, e)),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(_) => v.push(Entry {
+                            name,
+                            is_dir: false,
+                            size: 0,
+                            mtime: None,
+                            mode: 0,
+                        }),
                     }
                 }
                 Ok((canon, v))
@@ -361,6 +368,27 @@ mod tests {
             fs.create_new(&f).await.unwrap();
             fs.set_mode(&f, 0o750).await.unwrap();
             assert_eq!(fs.stat(&f).await.unwrap().unwrap().mode & 0o7777, 0o750);
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_list_survives_unstatable_children() {
+        guarded(async {
+            use std::os::unix::fs::PermissionsExt;
+            let (_t, root) = tmp();
+            let d = join(&root, "d");
+            std::fs::create_dir(&d).unwrap();
+            std::fs::write(join(&d, "f"), "x").unwrap();
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o444)).unwrap();
+            let is_root = std::fs::metadata(join(&d, "f")).is_ok();
+            let r = Fs::Local.list(&d).await;
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if is_root {
+                return;
+            }
+            let (_, v) = r.unwrap();
+            assert_eq!(v.iter().find(|x| x.name == "f").unwrap().mode, 0);
         })
         .await
     }
