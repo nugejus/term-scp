@@ -164,9 +164,10 @@ enum Op {
     },
 }
 
-/// `Visit(src, dst, entry, depth, keep)`: `keep` = nothing in this subtree is removed.
+/// `Visit(src, dst, entry, ancestors, keep)`: `ancestors` = canonical paths of the dirs above
+/// (its length is the depth); `keep` = nothing in this subtree is removed.
 enum Walk {
-    Visit(String, String, Entry, usize, bool),
+    Visit(String, String, Entry, Vec<String>, bool),
     Done(Op),
 }
 
@@ -194,14 +195,14 @@ async fn scan(
         Ok(None) => return bad.push((s.clone(), d, "not found".into())),
         Err(e) => return bad.push((s.clone(), d, e)),
     };
-    let mut stack = vec![Walk::Visit(s.clone(), d, e, 0, !mv)];
+    let mut stack = vec![Walk::Visit(s.clone(), d, e, vec![], !mv)];
     while let Some(w) = stack.pop() {
-        let (s, d, e, depth, keep) = match w {
+        let (s, d, e, anc, keep) = match w {
             Walk::Done(op) => {
                 ops.push(op);
                 continue;
             }
-            Walk::Visit(s, d, e, depth, keep) => (s, d, e, depth, keep),
+            Walk::Visit(s, d, e, anc, keep) => (s, d, e, anc, keep),
         };
         if e.is_regular() {
             ops.push(Op::File {
@@ -213,11 +214,15 @@ async fn scan(
             });
         } else if !e.is_dir {
             bad.push((s, d, "not a regular file".into()));
-        } else if depth > 64 {
+        } else if anc.len() > 64 {
             bad.push((s, d, "too deeply nested (symlink loop?)".into()));
         } else {
             match src.list(&s).await {
                 Err(e) => bad.push((s, d, e)),
+                // A link to a dir above (or at) itself would copy that dir into itself forever.
+                Ok((canon, _)) if anc.iter().any(|a| under(a, &canon)) => {
+                    bad.push((s, d, "symlink loop".into()))
+                }
                 // Children hang off the canonical path, so each lookup crosses at most one symlink.
                 Ok((canon, kids)) => {
                     // Reached through a symlink: its contents are copied, but Move only unlinks the link.
@@ -227,10 +232,12 @@ async fn scan(
                         let (dst, path) = (d.clone(), s);
                         stack.push(Walk::Done(Op::DirDone { dst, path, link }));
                     }
+                    let mut anc = anc;
+                    anc.push(canon.clone());
                     for k in kids.into_iter().rev() {
                         let kd = join(&d, &dst_name_for(src, dst, &k.name));
                         let ks = join(&canon, &k.name);
-                        stack.push(Walk::Visit(ks, kd, k, depth + 1, keep || link));
+                        stack.push(Walk::Visit(ks, kd, k, anc.clone(), keep || link));
                     }
                 }
             }
@@ -888,22 +895,32 @@ mod tests {
         guarded(async {
             let (_a, s) = tmp();
             let (_b, d) = tmp();
-            let sd = join(&s, "d");
+            let (sd, dd) = (join(&s, "d"), join(&d, "d"));
             std::fs::create_dir(&sd).unwrap();
+            std::fs::write(join(&sd, "a.txt"), "a").unwrap();
             std::os::unix::fs::symlink(".", join(&sd, "loop")).unwrap();
-            let log = run(
-                Fs::Local,
-                test_remote().await,
-                &[(sd, join(&d, "d"))],
-                false,
-                Skip,
-            )
-            .await;
-            assert!(
-                log.iter()
-                    .any(|e| e.starts_with("ItemError") && e.contains("too deeply nested"))
-            );
-            assert_eq!(count(&log, "Finished"), 1);
+            let log = run(Fs::Local, test_remote().await, &[(sd, dd.clone())], false, Skip).await;
+            assert!(ev(&log, "ItemError").contains("symlink loop"), "{log:?}");
+            assert!(ev(&log, "Finished").contains("copied: 1,"), "{log:?}");
+            assert_eq!(tree(&dd).keys().collect::<Vec<_>>(), ["a.txt"]);
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_ancestor_links_finish() {
+        guarded(async {
+            let (_a, s) = tmp();
+            let (_b, d) = tmp();
+            let (sd, dd) = (join(&s, "d"), join(&d, "d"));
+            std::fs::create_dir(&sd).unwrap();
+            std::fs::write(join(&sd, "a.txt"), "a").unwrap();
+            std::os::unix::fs::symlink(".", join(&sd, "l1")).unwrap();
+            std::os::unix::fs::symlink("..", join(&sd, "l2")).unwrap();
+            let log = run(Fs::Local, test_remote().await, &[(sd, dd.clone())], false, Skip).await;
+            assert_eq!(count(&log, "ItemError"), 2, "{log:?}");
+            assert!(ev(&log, "Finished").contains("copied: 1,"), "{log:?}");
+            assert_eq!(tree(&dd).keys().collect::<Vec<_>>(), ["a.txt"]);
         })
         .await
     }
