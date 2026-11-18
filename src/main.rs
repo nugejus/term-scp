@@ -3,6 +3,7 @@ mod fs;
 mod icons;
 mod model;
 mod transfer;
+mod view;
 use clap::Parser;
 
 #[derive(Parser)]
