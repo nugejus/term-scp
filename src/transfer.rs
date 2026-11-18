@@ -1,4 +1,4 @@
-use crate::fs::{Entry, Fs, join, parent};
+use crate::fs::{Entry, Fs, join, normalize, parent};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -124,23 +124,28 @@ pub async fn write_via_part(
 
 enum Op {
     Dir {
-        src: String,
         dst: String,
     },
+    /// `rm`: Move removes `src` after it copied.
     File {
         src: String,
         dst: String,
         size: u64,
         mode: u32,
+        rm: bool,
     },
+    /// Move only, after the subtree at `dst`: remove `path`, a symlink when `link`.
     DirDone {
-        src: String,
+        dst: String,
+        path: String,
+        link: bool,
     },
 }
 
+/// `Visit(src, dst, entry, depth, keep)`: `keep` = nothing in this subtree is removed.
 enum Walk {
-    Visit(String, String, Entry, usize),
-    Done(String),
+    Visit(String, String, Entry, usize, bool),
+    Done(Op),
 }
 
 /// `p` is `dir` or lies under it.
@@ -148,14 +153,14 @@ fn under(p: &str, dir: &str) -> bool {
     p == dir || p.starts_with(&join(dir, ""))
 }
 
-/// Walks one item into `ops`; bad entries go to `bad` as (src, error).
+/// Walks one item into `ops`; bad entries go to `bad` as (src, dst, error).
 async fn scan(
     src: &Fs,
     dst: &Fs,
     item: &(String, String),
     mv: bool,
     ops: &mut Vec<Op>,
-    bad: &mut Vec<(String, String)>,
+    bad: &mut Vec<(String, String, String)>,
 ) {
     let (s, d) = item;
     // Only the item's own name is normalized; the existing parent is used as-is.
@@ -164,17 +169,17 @@ async fn scan(
     });
     let e = match src.stat(s).await {
         Ok(Some(e)) => e,
-        Ok(None) => return bad.push((s.clone(), "not found".into())),
-        Err(e) => return bad.push((s.clone(), e)),
+        Ok(None) => return bad.push((s.clone(), d, "not found".into())),
+        Err(e) => return bad.push((s.clone(), d, e)),
     };
-    let mut stack = vec![Walk::Visit(s.clone(), d, e, 0)];
+    let mut stack = vec![Walk::Visit(s.clone(), d, e, 0, !mv)];
     while let Some(w) = stack.pop() {
-        let (s, d, e, depth) = match w {
-            Walk::Done(s) => {
-                ops.push(Op::DirDone { src: s });
+        let (s, d, e, depth, keep) = match w {
+            Walk::Done(op) => {
+                ops.push(op);
                 continue;
             }
-            Walk::Visit(s, d, e, depth) => (s, d, e, depth),
+            Walk::Visit(s, d, e, depth, keep) => (s, d, e, depth, keep),
         };
         if e.is_regular() {
             ops.push(Op::File {
@@ -182,26 +187,28 @@ async fn scan(
                 dst: d,
                 size: e.size,
                 mode: e.mode,
+                rm: !keep,
             });
         } else if !e.is_dir {
-            bad.push((s, "not a regular file".into()));
+            bad.push((s, d, "not a regular file".into()));
         } else if depth > 64 {
-            bad.push((s, "too deeply nested (symlink loop?)".into()));
+            bad.push((s, d, "too deeply nested (symlink loop?)".into()));
         } else {
             match src.list(&s).await {
-                Err(e) => bad.push((s, e)),
+                Err(e) => bad.push((s, d, e)),
                 // Children hang off the canonical path, so each lookup crosses at most one symlink.
                 Ok((canon, kids)) => {
-                    ops.push(Op::Dir {
-                        src: canon.clone(),
-                        dst: d.clone(),
-                    });
-                    if mv {
-                        stack.push(Walk::Done(canon.clone()));
+                    // Reached through a symlink: its contents are copied, but Move only unlinks the link.
+                    let link = canon != normalize(&s);
+                    ops.push(Op::Dir { dst: d.clone() });
+                    if !keep {
+                        let (dst, path) = (d.clone(), s);
+                        stack.push(Walk::Done(Op::DirDone { dst, path, link }));
                     }
                     for k in kids.into_iter().rev() {
                         let kd = join(&d, &dst_name_for(src, dst, &k.name));
-                        stack.push(Walk::Visit(join(&canon, &k.name), kd, k, depth + 1));
+                        let ks = join(&canon, &k.name);
+                        stack.push(Walk::Visit(ks, kd, k, depth + 1, keep || link));
                     }
                 }
             }
@@ -249,11 +256,12 @@ pub async fn run_job(job: Job, emit: Emit) {
         })
     };
     let mut failed = bad.len();
-    // Source paths that stay (failed or skipped); their dirs are not removed.
+    // Dst paths of items that failed or were skipped: Move removes no source dir above them.
+    // Dst paths, not src: they form a true tree even where the walk followed a symlink.
     let mut kept = Vec::new();
-    for (p, e) in bad {
-        item_err(&p, e);
-        kept.push(p);
+    for (s, d, e) in bad {
+        item_err(&s, e);
+        kept.push(d);
     }
     let (total_bytes, total_files) = ops.iter().fold((0, 0), |(b, n), op| match op {
         Op::File { size, .. } => (b + size, n + 1),
@@ -278,9 +286,8 @@ pub async fn run_job(job: Job, emit: Emit) {
     let mut broken: Option<String> = None;
     for op in ops {
         match op {
-            Op::Dir { src: s, dst: d } => {
+            Op::Dir { dst: d } => {
                 if broken.as_deref().is_some_and(|b| under(&d, b)) {
-                    kept.push(s);
                     continue;
                 }
                 let r = match dst.stat(&d).await {
@@ -292,7 +299,7 @@ pub async fn run_job(job: Job, emit: Emit) {
                 if let Err(e) = r {
                     item_err(&d, e);
                     failed += 1;
-                    kept.push(s);
+                    kept.push(d.clone());
                     broken = Some(d);
                 }
             }
@@ -301,6 +308,7 @@ pub async fn run_job(job: Job, emit: Emit) {
                 dst: d,
                 size,
                 mode,
+                rm,
             } => {
                 let base = prog.bytes;
                 prog.current = parent(&s).map_or(s.clone(), |p| p.1);
@@ -338,7 +346,8 @@ pub async fn run_job(job: Job, emit: Emit) {
                         &mut on_bytes,
                     )
                     .await?;
-                    if job.mv {
+                    if rm {
+                        // `s` is the link itself when the file is a symlink.
                         src.remove_file(&s).await?;
                     }
                     Ok(Resolution::Overwrite)
@@ -351,28 +360,32 @@ pub async fn run_job(job: Job, emit: Emit) {
                     }
                     Ok(Resolution::Skip) => {
                         skipped += 1;
-                        kept.push(s);
+                        kept.push(d);
                     }
                     Ok(_) => copied += 1,
                     Err(e) => {
                         item_err(&d, e);
                         failed += 1;
-                        kept.push(s);
+                        kept.push(d);
                     }
                 }
                 prog.bytes = base + size;
                 prog.files += 1;
                 prog.tick(false);
             }
-            Op::DirDone { src: s } => {
+            Op::DirDone { dst: d, path, link } => {
                 // ponytail: O(n²) prefix scan, fine for thousands of items
-                if kept.iter().any(|k| under(k, &s)) {
+                if kept.iter().any(|k| under(k, &d)) {
                     continue;
                 }
-                if let Err(e) = src.remove_dir(&s).await {
-                    item_err(&s, e);
+                let r = match link {
+                    true => src.remove_file(&path).await,
+                    false => src.remove_dir(&path).await,
+                };
+                if let Err(e) = r {
+                    item_err(&path, e);
                     failed += 1;
-                    kept.push(s);
+                    kept.push(d);
                 }
             }
         }
@@ -950,6 +963,51 @@ mod tests {
                     "f{i} differs"
                 );
             }
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn move_symlinked_dir_removes_link_not_target() {
+        guarded(async {
+            let (_a, s) = tmp();
+            let (_b, d) = tmp();
+            let (shared, sd, dd) = (join(&s, "shared"), join(&s, "d"), join(&d, "d"));
+            std::fs::create_dir(&shared).unwrap();
+            std::fs::create_dir(&sd).unwrap();
+            std::fs::write(join(&shared, "s.txt"), "shared").unwrap();
+            std::fs::write(join(&sd, "a.txt"), "a").unwrap();
+            std::os::unix::fs::symlink("../shared", join(&sd, "link")).unwrap();
+            std::os::unix::fs::symlink("../shared/s.txt", join(&sd, "flink")).unwrap();
+            let log = run(
+                Fs::Local,
+                test_remote().await,
+                &[(sd.clone(), dd.clone())],
+                true,
+                Skip,
+            )
+            .await;
+            assert!(
+                ev(&log, "Finished").contains("copied: 3, skipped: 0, failed: 0"),
+                "{log:?}"
+            );
+            assert_eq!(
+                tree(&dd).keys().collect::<Vec<_>>(),
+                ["a.txt", "flink", "link/s.txt"]
+            );
+            assert_eq!(
+                std::fs::read_to_string(join(&dd, "link/s.txt")).unwrap(),
+                "shared"
+            );
+            assert_eq!(
+                std::fs::read_to_string(join(&dd, "flink")).unwrap(),
+                "shared"
+            );
+            assert_eq!(
+                std::fs::read_to_string(join(&shared, "s.txt")).unwrap(),
+                "shared"
+            );
+            assert!(!exists(&sd));
         })
         .await
     }
