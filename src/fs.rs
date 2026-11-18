@@ -497,6 +497,60 @@ impl Fs {
         }
     }
 
+    /// `rename` that never replaces an existing `to`; a local rename would, silently.
+    pub async fn rename_new(&self, from: &str, to: &str) -> Result<(), String> {
+        let taken = match self {
+            // `to` may be `from` itself: a case-only rename on a case-insensitive disk.
+            Fs::Local => match (
+                fs::symlink_metadata(from).await,
+                fs::symlink_metadata(to).await,
+            ) {
+                (Ok(a), Ok(b)) => (a.dev(), a.ino()) != (b.dev(), b.ino()),
+                (_, b) => b.is_ok(),
+            },
+            Fs::Remote(_) => self.stat(to).await?.is_some(),
+        };
+        if taken {
+            return Err(format!("{to}: already exists"));
+        }
+        self.rename(from, to).await
+    }
+
+    /// A file, or a folder with everything in it. Symlinks are removed, never followed.
+    pub async fn remove_all(&self, path: &str) -> Result<(), String> {
+        match self {
+            Fs::Local => {
+                let m = fs::symlink_metadata(path).await.map_err(|e| err(path, e))?;
+                let r = match m.is_dir() {
+                    true => fs::remove_dir_all(path).await,
+                    false => fs::remove_file(path).await,
+                };
+                r.map_err(|e| err(path, e))
+            }
+            Fs::Remote(r) => {
+                // Depth first: a folder's (path, true) comes off the stack after all it held.
+                let mut stack = vec![(path.to_string(), false)];
+                while let Some((p, emptied)) = stack.pop() {
+                    if emptied {
+                        self.remove_dir(&p).await?;
+                        continue;
+                    }
+                    let a = r.sftp.symlink_metadata(&p).await.map_err(|e| rerr(&p, e))?;
+                    if a.permissions.unwrap_or(0) & 0o170000 != 0o040000 {
+                        self.remove_file(&p).await?;
+                        continue;
+                    }
+                    stack.push((p.clone(), true));
+                    // ReadDir skips `.` and `..`.
+                    for de in r.sftp.read_dir(&p).await.map_err(|e| rerr(&p, e))? {
+                        stack.push((join(&p, &de.file_name()), false));
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
     pub async fn replace(&self, part: &str, dest: &str) -> Result<(), String> {
         match self {
             Fs::Local => self.rename(part, dest).await,
@@ -649,6 +703,71 @@ mod tests {
             fs.replace(&part, &dest).await.unwrap();
             assert_eq!(std::fs::read_to_string(&dest).unwrap(), "new");
             assert_eq!(fs.stat(&part).await.unwrap(), None);
+        })
+        .await
+    }
+
+    /// `d/x`, `d/e/y` and `d/l` → a folder outside: the tree goes, the link's target stays.
+    async fn remove_all_check(fs: Fs) {
+        let (_t, root) = tmp();
+        let (d, out) = (join(&root, "d"), join(&root, "out"));
+        std::fs::create_dir_all(join(&d, "e")).unwrap();
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(join(&d, "x"), "x").unwrap();
+        std::fs::write(join(&d, "e/y"), "y").unwrap();
+        std::fs::write(join(&out, "z"), "z").unwrap();
+        std::os::unix::fs::symlink(&out, join(&d, "l")).unwrap();
+        let f = join(&root, "f");
+        std::fs::write(&f, "f").unwrap();
+        fs.remove_all(&d).await.unwrap();
+        fs.remove_all(&f).await.unwrap();
+        assert!(!std::path::Path::new(&d).exists());
+        assert!(!std::path::Path::new(&f).exists());
+        assert!(std::path::Path::new(&join(&out, "z")).exists());
+        assert!(fs.remove_all(&d).await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_remove_all() {
+        guarded(remove_all_check(Fs::Local)).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_remove_all() {
+        guarded(async { remove_all_check(test_remote().await).await }).await
+    }
+
+    async fn rename_new_check(fs: Fs) {
+        let (_t, root) = tmp();
+        let (a, b, c) = (join(&root, "a"), join(&root, "b"), join(&root, "c"));
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        let e = fs.rename_new(&a, &b).await.unwrap_err();
+        assert!(e.contains("already exists"), "{e}");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "b");
+        fs.rename_new(&a, &c).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&c).unwrap(), "a");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_rename_new() {
+        guarded(rename_new_check(Fs::Local)).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_rename_new() {
+        guarded(async { rename_new_check(test_remote().await).await }).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_rename_new_case_only() {
+        guarded(async {
+            let (_t, root) = tmp();
+            let (a, upper) = (join(&root, "a"), join(&root, "A"));
+            std::fs::write(&a, "a").unwrap();
+            Fs::Local.rename_new(&a, &upper).await.unwrap();
+            let (_, v) = Fs::Local.list(&root).await.unwrap();
+            assert_eq!(v[0].name, "A");
         })
         .await
     }

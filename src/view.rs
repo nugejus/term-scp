@@ -2,7 +2,7 @@ use crate::icons::icon;
 use crate::model::{App, InputKind, Popup, Side, TOOLBAR, Transfers};
 use chrono::{Datelike, Local, TimeZone};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -11,9 +11,10 @@ use ratatui::widgets::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// The Key table from Global Constraints: (key, help text).
-const HELP: [(&str, &str); 18] = [
+const HELP: [(&str, &str); 22] = [
     ("↑ / ↓", "Move cursor"),
     ("Shift+↑ / Shift+↓", "Select range"),
+    ("15 ↓ / 15 ↑", "Move 15 rows (any number)"),
     ("PgUp / PgDn / Home / End", "Page / first / last"),
     ("Backspace", "Parent dir"),
     ("Enter", "Open dir"),
@@ -26,6 +27,9 @@ const HELP: [(&str, &str); 18] = [
     ("n", "New dir"),
     ("N", "New file"),
     ("g", "Change dir"),
+    ("d", "Delete"),
+    ("r", "Rename"),
+    ("f", "Filter by name"),
     ("?", "Help"),
     ("Ctrl+R", "Refresh"),
     ("q", "Quit"),
@@ -61,7 +65,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         f.render_widget(Line::from(progress).right_aligned(), rest);
     }
 
-    let halves: [Rect; 2] = Layout::horizontal([Constraint::Fill(1); 2]).areas(mid);
+    // A cell is about twice as tall as wide: on a portrait screen the panes stack, left on top.
+    let area = f.area();
+    let dir = match area.height * 2 > area.width {
+        true => Direction::Vertical,
+        false => Direction::Horizontal,
+    };
+    let halves: [Rect; 2] = Layout::new(dir, [Constraint::Fill(1); 2]).areas(mid);
     app.hit.boxes = halves;
     for side in [Side::Left, Side::Right] {
         app.hit.panes[side.idx()] = draw_pane(f, app, side, halves[side.idx()]);
@@ -71,6 +81,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Some(d) if d.at.is_some() && !d.items.is_empty() => {
             format!("Drop to copy {} item(s)", d.items.len())
         }
+        _ if app.count > 0 => app.count.to_string(), // no message can hide a pending count
         _ => app.status.clone(),
     };
     let p = &app.panes[app.focus.idx()];
@@ -101,6 +112,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let full = f.area().width as usize;
     match &app.popup {
         Some(Popup::Input {
+            kind: InputKind::Filter,
+            ..
+        }) => {} // a bar in the pane, drawn by draw_pane
+        Some(Popup::Input {
             kind,
             title,
             value,
@@ -126,6 +141,19 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Some(Popup::ConfirmQuit) => {
             let q = "Transfers are running. Quit and cancel them? [y/N]";
             popup(f, "Quit", vec![Line::from(q)], 0);
+        }
+        Some(Popup::ConfirmDelete { items, .. }) => {
+            let what = match &items[..] {
+                // Cut to fit, so `? [y/N]` always shows.
+                [one] => format!("\"{}\"", fit_left(&one.name, full.saturating_sub(20))),
+                v => format!("{} items", v.len()),
+            };
+            let mut lines = vec![Line::from(format!("Delete {what}? [y/N]"))];
+            if items.iter().any(|e| e.is_dir) {
+                let note = "Folders go with everything in them.";
+                lines.push(Line::styled(note, Color::DarkGray));
+            }
+            popup(f, "Delete", lines, 0);
         }
         None => {
             if let Some(c) = app.conflicts.front() {
@@ -164,6 +192,41 @@ fn draw_pane(f: &mut Frame, app: &mut App, side: Side, area: Rect) -> Rect {
     };
     let block = Block::bordered().border_type(kind).border_style(border);
     let inner = block.inner(area);
+    // The filter's bar on the top row: the line being typed, or the filter in force.
+    let label = Span::styled("Filter: ", Style::new().fg(Color::Yellow).bold());
+    let bar = match &app.popup {
+        Some(Popup::Input {
+            kind: InputKind::Filter,
+            value,
+            cursor,
+            ..
+        }) if focused => {
+            // One row: the end of the text before the cursor, the cursor cell, then the rest.
+            let chars: Vec<char> = value.chars().collect();
+            let before: String = chars[..*cursor].iter().collect();
+            let at = chars.get(*cursor).map_or(" ".into(), char::to_string);
+            let after: String = chars.iter().skip(*cursor + 1).collect();
+            let w = (inner.width as usize).saturating_sub(label.width() + at.width());
+            Some(Line::from(vec![
+                label,
+                Span::raw(fit_left(&before, w)),
+                Span::styled(at, Modifier::REVERSED),
+                Span::raw(after),
+                Span::styled("  Enter keep · Esc clear", Color::DarkGray),
+            ]))
+        }
+        _ if p.filter.is_empty() => None,
+        _ => Some(Line::from(vec![label, Span::raw(p.filter.clone())])),
+    };
+    let rows_area = match bar {
+        None => inner,
+        Some(bar) => {
+            let [top, rest] =
+                Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+            f.render_widget(bar, top);
+            rest
+        }
+    };
 
     let mut suffix = vec![];
     if p.loading.is_some() {
@@ -224,9 +287,9 @@ fn draw_pane(f: &mut Frame, app: &mut App, side: Side, area: Rect) -> Rect {
     let mut state = TableState::default()
         .with_offset(p.offset)
         .with_selected(Some(p.cursor));
-    f.render_stateful_widget(table, inner, &mut state);
+    f.render_stateful_widget(table, rows_area, &mut state);
     p.offset = state.offset();
-    inner
+    rows_area
 }
 
 /// Centered bordered box sized to its lines (at least `min_w` inner columns), clamped to the frame.
@@ -579,10 +642,92 @@ mod tests {
         assert_eq!(b[(r.x - 1, r.y - 1)].fg, Color::DarkGray);
     }
 
+    #[test]
+    fn filter_bar_sits_on_top_of_the_pane() {
+        let mut a = app("/d", vec![file("apple", 1), file("banana", 1)]);
+        a.panes[0].set_filter("an");
+        let b = render(&mut a, 80, 12);
+        assert!(row(&b, 2).contains("Filter: an"), "{}", row(&b, 2));
+        assert!(row(&b, 3).contains(".."), "{}", row(&b, 3));
+        assert!(row(&b, 4).contains("banana") && !row(&b, 5).contains("apple"));
+        assert_eq!(a.hit.panes[0].y, 3); // clicks map to rows below the bar
+        let value = "an".to_string();
+        a.popup = Some(Popup::Input {
+            kind: InputKind::Filter,
+            title: "Filter".into(),
+            value,
+            cursor: 1,
+        });
+        let b = render(&mut a, 80, 12);
+        let r = row(&b, 2);
+        assert!(r.contains("Filter: an") && r.contains("Esc clear"), "{r}");
+        let x = r[..r.find("an").unwrap()].chars().count() as u16 + 1; // the cursor on the n
+        assert!(b[(x, 2)].modifier.contains(Modifier::REVERSED));
+        assert!(!row(&b, 5).contains("┏"), "no centered popup");
+        let value = "abcdefghijklmnopqrstuvwxyz0123456789".to_string();
+        let cursor = value.chars().count();
+        a.popup = Some(Popup::Input {
+            kind: InputKind::Filter,
+            title: "Filter".into(),
+            value,
+            cursor,
+        });
+        let r = row(&render(&mut a, 80, 12), 2);
+        assert!(r.contains("Filter: …") && r.contains("789"), "{r}"); // the end stays in view
+    }
+
+    #[test]
+    fn pending_count_beats_the_message() {
+        let mut a = app("/d", vec![]);
+        a.status = "Copied 1 item(s)".into();
+        a.count = 15;
+        let b = render(&mut a, 80, 12);
+        assert!(row(&b, 11).trim_end().ends_with("15"), "{}", row(&b, 11));
+    }
+
+    #[test]
+    fn delete_popup_names_the_item_and_warns_for_folders() {
+        let mut a = app("/d", vec![]);
+        let dir = Entry {
+            is_dir: true,
+            ..file("stuff", 0)
+        };
+        let dir_name = "/d".to_string();
+        a.popup = Some(Popup::ConfirmDelete {
+            dir: dir_name.clone(),
+            items: vec![file("a.txt", 1)],
+        });
+        let b = render(&mut a, 80, 12);
+        let ((_, y), _) = popup_top(&b, "Delete");
+        assert!(row(&b, y + 1).contains("Delete \"a.txt\"? [y/N]"));
+        assert!(!row(&b, y + 2).contains("Folders"));
+        a.popup = Some(Popup::ConfirmDelete {
+            dir: dir_name,
+            items: vec![file("a.txt", 1), dir],
+        });
+        let b = render(&mut a, 80, 12);
+        let ((_, y), _) = popup_top(&b, "Delete");
+        assert!(row(&b, y + 1).contains("Delete 2 items? [y/N]"));
+        assert!(row(&b, y + 2).contains("Folders go with everything in them."));
+        a.popup = Some(Popup::ConfirmDelete {
+            dir: "/d".into(),
+            items: vec![file(&"x".repeat(200), 1)],
+        });
+        let b = render(&mut a, 80, 12);
+        let ((_, y), _) = popup_top(&b, "Delete");
+        let r = row(&b, y + 1);
+        assert!(
+            r.contains("Delete \"…x") && r.contains("x\"? [y/N] ┃"),
+            "{r}"
+        );
+    }
+
     /// The popup's top-left corner and width, found by its title.
     fn popup_top(b: &Buffer, title: &str) -> ((u16, u16), usize) {
         let head = format!("┏ {title} ");
-        let y = (0..b.area.height).find(|&y| row(b, y).contains(&head)).unwrap();
+        let y = (0..b.area.height)
+            .find(|&y| row(b, y).contains(&head))
+            .unwrap();
         let r: Vec<char> = row(b, y).chars().collect();
         let l = r.iter().rposition(|&c| c == '┏').unwrap();
         let rr = r.iter().rposition(|&c| c == '┓').unwrap();
@@ -646,6 +791,17 @@ mod tests {
         t.draw(|f| draw(f, &mut a)).unwrap();
         assert_eq!(a.hit.toolbar.len(), 6);
         assert!(a.hit.panes[1].x > a.hit.panes[0].x);
+    }
+
+    #[test]
+    fn portrait_screen_stacks_the_panes() {
+        let mut a = app("/d", vec![file("a.txt", 1)]);
+        render(&mut a, 40, 21); // 21 rows look taller than 40 columns
+        let [top, bottom] = a.hit.boxes;
+        assert_eq!((top.x, top.width), (bottom.x, 40));
+        assert_eq!(bottom.y, top.bottom());
+        render(&mut a, 40, 20); // square: side by side again
+        assert!(a.hit.boxes[1].x > a.hit.boxes[0].x);
     }
 
     #[test]

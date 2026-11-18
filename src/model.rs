@@ -3,6 +3,7 @@ use crate::transfer::{JobId, Resolution};
 use ratatui::layout::{Position, Rect};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Instant;
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Side {
@@ -42,6 +43,9 @@ pub enum Command {
     NewDir,
     NewFile,
     ChangeDir,
+    Delete,
+    Rename,
+    Filter,
     Help,
     Refresh,
     Quit,
@@ -59,7 +63,9 @@ pub const TOOLBAR: [(&str, Command); 6] = [
 pub struct Pane {
     pub fs: Fs,
     pub cwd: String,
-    pub entries: Vec<Entry>, // entries[0] is ".." unless cwd == "/"
+    pub entries: Vec<Entry>, // `all` as the filter shows it; entries[0] is ".." unless cwd == "/"
+    all: Vec<Entry>,
+    pub filter: String,
     pub cursor: usize,
     pub offset: usize,
     pub marked: BTreeSet<String>,
@@ -74,6 +80,8 @@ impl Pane {
             fs,
             cwd,
             entries: vec![],
+            all: vec![],
+            filter: String::new(),
             cursor: 0,
             offset: 0,
             marked: BTreeSet::new(),
@@ -98,7 +106,11 @@ impl Pane {
             );
         }
         let same = cwd == self.cwd;
-        self.entries = entries;
+        if !same {
+            self.filter.clear();
+        }
+        self.all = entries;
+        self.entries = self.visible();
         if same {
             let names = &self.entries;
             self.marked.retain(|m| names.iter().any(|e| &e.name == m));
@@ -115,6 +127,34 @@ impl Pane {
         self.cwd = cwd;
         self.anchor = None;
         self.loading = None;
+    }
+
+    /// `all` minus what the filter hides: names without it, ignoring case. `..` always shows.
+    /// NFC on both sides, so a typed 한글 matches a name macOS stored decomposed.
+    fn visible(&self) -> Vec<Entry> {
+        let key = |s: &str| s.nfc().collect::<String>().to_lowercase();
+        let q = key(&self.filter);
+        let shown = |e: &&Entry| e.name == ".." || key(&e.name).contains(&q);
+        self.all.iter().filter(shown).cloned().collect()
+    }
+
+    /// Marks on files it hides are dropped. The cursor stays on its file while that shows,
+    /// else goes to the first match.
+    pub fn set_filter(&mut self, filter: &str) {
+        if filter == self.filter {
+            return; // e.g. f then Esc on no filter: the cursor stays, even on ..
+        }
+        let keep = self.current().map(|e| e.name.clone());
+        self.filter = filter.into();
+        self.entries = self.visible();
+        let names = &self.entries;
+        self.marked.retain(|m| names.iter().any(|e| &e.name == m));
+        self.anchor = None;
+        let at = |n: &str| names.iter().position(|e| e.name == n);
+        let first = names.iter().position(|e| e.name != "..");
+        let keep = keep.filter(|k| k != "..").and_then(|k| at(&k));
+        self.cursor = keep.or(first).unwrap_or(0);
+        self.offset = 0; // the table scrolls just enough to show the cursor
     }
 
     pub fn move_cursor(&mut self, delta: isize, extend: bool) {
@@ -186,6 +226,11 @@ pub enum InputKind {
     ChangeDir {
         base: String,
     },
+    Rename {
+        dir: String,
+        from: String,
+    },
+    Filter, // of the focused pane, applied as typed
     CopyTo {
         from: Side,
         items: Vec<Entry>,
@@ -202,6 +247,10 @@ pub enum Popup {
     },
     Help,
     ConfirmQuit,
+    ConfirmDelete {
+        dir: String,
+        items: Vec<Entry>,
+    },
 }
 pub struct ConflictPrompt {
     pub job: JobId,
@@ -270,8 +319,8 @@ pub struct Hit {
 }
 pub struct Drag {
     pub from: Side,
-    pub items: Vec<Entry>, // fixed at press time
-    pub src_cwd: String,   // likewise: a listing landing mid-drag can't move the sources
+    pub items: Vec<Entry>,    // fixed at press time
+    pub src_cwd: String,      // likewise: a listing landing mid-drag can't move the sources
     pub at: Option<Position>, // the pointer, once it has moved: where the ghost is drawn
 }
 pub struct App {
@@ -285,6 +334,7 @@ pub struct App {
     pub drag: Option<Drag>,
     pub last_click: Option<(Instant, Side, usize)>,
     pub icons: bool,
+    pub count: usize, // digits typed before ↑ / ↓; 0 = none
     pub quit: bool,
 }
 impl App {
@@ -300,6 +350,7 @@ impl App {
             drag: None,
             last_click: None,
             icons,
+            count: 0,
             quit: false,
         }
     }
@@ -323,6 +374,9 @@ mod tests {
         let mut p = Pane::new(Fs::Local, cwd.into());
         p.set_listing(cwd.into(), names.iter().map(|n| f(n)).collect(), None);
         p
+    }
+    fn names(p: &Pane) -> Vec<&str> {
+        p.entries.iter().map(|e| e.name.as_str()).collect()
     }
     fn marks(p: &Pane) -> Vec<&str> {
         p.marked.iter().map(|s| s.as_str()).collect()
@@ -430,6 +484,50 @@ mod tests {
         t.jobs.remove(&1);
         t.sample(t0 + Duration::from_secs(2));
         assert_eq!(t.speed, 500_000.0);
+    }
+
+    #[test]
+    fn filter_narrows_keeps_dotdot_and_drops_hidden_marks() {
+        let mut p = pane("/a", &["apple", "Banana", "cherry"]);
+        p.marked.insert("cherry".into());
+        p.marked.insert("Banana".into());
+        p.set_filter("AN");
+        assert_eq!(names(&p), ["..", "Banana"]);
+        assert_eq!(marks(&p), ["Banana"]);
+        assert_eq!(p.current().unwrap().name, "Banana"); // first match, not ..
+        p.set_filter("");
+        assert_eq!(names(&p), ["..", "apple", "Banana", "cherry"]);
+        assert_eq!(p.current().unwrap().name, "Banana"); // stays on its file
+        p.set_filter("zzz");
+        assert_eq!(names(&p), [".."]);
+        assert_eq!(p.cursor, 0);
+    }
+
+    #[test]
+    fn unchanged_filter_keeps_dotdot_and_a_new_one_scrolls_to_top() {
+        let mut p = pane("/a", &["x", "y"]);
+        p.set_filter("");
+        assert_eq!(p.cursor, 0); // f then Esc stays on ..
+        p.offset = 5;
+        p.set_filter("y");
+        assert_eq!(p.offset, 0);
+    }
+
+    #[test]
+    fn filter_matches_decomposed_hangul() {
+        let mut p = pane("/", &["\u{1112}\u{1161}\u{11ab}.txt", "b"]); // 한 in NFD
+        p.set_filter("한");
+        assert_eq!(p.entries.len(), 1);
+    }
+
+    #[test]
+    fn refresh_keeps_filter_cd_clears_it() {
+        let mut p = pane("/a", &["x1", "y"]);
+        p.set_filter("x");
+        p.set_listing("/a".into(), vec![f("x1"), f("x2"), f("y")], None);
+        assert_eq!(names(&p), ["..", "x1", "x2"]);
+        p.set_listing("/b".into(), vec![f("x1"), f("y")], None);
+        assert_eq!((p.filter.as_str(), names(&p)), ("", vec!["..", "x1", "y"]));
     }
 
     #[test]

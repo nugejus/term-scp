@@ -74,15 +74,18 @@ pub fn dst_name_for(src: &Fs, dst: &Fs, name: &str) -> String {
     }
 }
 
-/// Destinations being written right now, as (dst is local, path): one writer per `<dest>.term-scp-part`.
-static CLAIMS: LazyLock<Mutex<HashSet<(bool, String)>>> = LazyLock::new(Default::default);
+/// Destinations being written right now, as (host, path), local = None: one writer per
+/// `<dest>.term-scp-part`. The host matters with two of them: same path, different files.
+type Key = (Option<String>, String);
+static CLAIMS: LazyLock<Mutex<HashSet<Key>>> = LazyLock::new(Default::default);
 
 /// Holds a destination in `CLAIMS` until dropped, on every exit path.
-struct Claim((bool, String));
+struct Claim(Key);
 
 impl Claim {
     fn take(dst: &Fs, path: &str) -> Option<Claim> {
-        let key = (dst.is_local(), path.to_string());
+        let host = (!dst.is_local()).then(|| dst.label());
+        let key = (host, path.to_string());
         // Separate statement: the guard must be gone before a Claim could ever drop.
         let fresh = CLAIMS.lock().unwrap().insert(key.clone());
         fresh.then(|| Claim(key))
@@ -457,7 +460,7 @@ pub fn submit(rt: &tokio::runtime::Handle, sem: Arc<Semaphore>, job: Job, emit: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::test_remote;
+    use crate::fs::{Remote, test_remote};
     use Resolution::*;
     use std::collections::BTreeMap;
     use std::pin::Pin;
@@ -807,6 +810,26 @@ mod tests {
             first.await.unwrap().unwrap();
             assert!(std::fs::read(&dest).unwrap() == one, "dest corrupted");
             assert!(Claim::take(&dst, &dest).is_some(), "claim not released");
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn claims_tell_two_hosts_apart() {
+        guarded(async {
+            let p = crate::fs::sftp_server_path();
+            let host = async |label: &str| {
+                let argv = std::slice::from_ref(&p);
+                Fs::Remote(Arc::new(
+                    Remote::connect(label, argv, vec![p.clone()]).await.unwrap(),
+                ))
+            };
+            let (web1, web2) = (host("web1").await, host("web2").await);
+            let path = "/claims_tell_two_hosts_apart";
+            let _held = Claim::take(&web1, path).unwrap();
+            assert!(Claim::take(&web1, path).is_none());
+            assert!(Claim::take(&web2, path).is_some());
+            assert!(Claim::take(&Fs::Local, path).is_some());
         })
         .await
     }

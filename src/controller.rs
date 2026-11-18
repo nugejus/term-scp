@@ -60,6 +60,9 @@ pub fn key_to_command(k: KeyEvent) -> Option<Command> {
         KeyCode::Char('n') => NewDir,
         KeyCode::Char('N') => NewFile,
         KeyCode::Char('g') => ChangeDir,
+        KeyCode::Char('d') => Delete,
+        KeyCode::Char('r') => Rename,
+        KeyCode::Char('f') => Filter,
         KeyCode::Char('?') => Help,
         KeyCode::Char('q') => Quit,
         _ => return None,
@@ -142,7 +145,19 @@ impl Controller {
                     return;
                 }
                 match result {
-                    Ok((cwd, entries)) => p.set_listing(cwd, entries, select.as_deref()),
+                    Ok((cwd, entries)) => {
+                        p.set_listing(cwd, entries, select.as_deref());
+                        // While the bar is open, the filter is what it shows, whatever folder landed.
+                        if let Some(Popup::Input {
+                            kind: InputKind::Filter,
+                            value,
+                            ..
+                        }) = &app.popup
+                            && side == app.focus
+                        {
+                            p.set_filter(value);
+                        }
+                    }
                     Err(e) => {
                         p.loading = None;
                         let tail = match &p.fs {
@@ -160,14 +175,23 @@ impl Controller {
                 side,
                 select,
                 result,
-            } => match result {
-                Ok(()) if app.panes[side.idx()].loading.is_some() => self.reload(app, side),
-                Ok(()) => {
+            } => {
+                // A failure reloads too (a delete that failed midway removed the rest),
+                // but the cursor stays: a refused rename's target is not the user's file.
+                let select = match result {
+                    Ok(()) => select,
+                    Err(e) => {
+                        app.status = e;
+                        None
+                    }
+                };
+                if app.panes[side.idx()].loading.is_some() {
+                    self.reload(app, side);
+                } else {
                     let cwd = app.panes[side.idx()].cwd.clone();
                     self.load(app, side, cwd, select);
                 }
-                Err(e) => app.status = e,
-            },
+            }
             AppEvent::Transfer(t) => self.on_transfer(app, t),
         }
     }
@@ -186,7 +210,12 @@ impl Controller {
             }) => {
                 match k.code {
                     KeyCode::Enter => return self.confirm(app, kind, value),
-                    KeyCode::Esc => return,
+                    KeyCode::Esc => {
+                        if let InputKind::Filter = kind {
+                            app.panes[app.focus.idx()].set_filter("");
+                        }
+                        return;
+                    }
                     KeyCode::Char('u') if ctrl => (value, cursor) = (String::new(), 0),
                     KeyCode::Char(c) if !ctrl => {
                         value.insert(byte_at(&value, cursor), c);
@@ -202,6 +231,9 @@ impl Controller {
                     KeyCode::End => cursor = value.chars().count(),
                     _ => {}
                 }
+                if let InputKind::Filter = kind {
+                    app.panes[app.focus.idx()].set_filter(&value);
+                }
                 app.popup = Some(Popup::Input {
                     kind,
                     title,
@@ -211,6 +243,21 @@ impl Controller {
             }
             Some(Popup::Help) => {}
             Some(Popup::ConfirmQuit) => app.quit = matches!(k.code, KeyCode::Char('y' | 'Y')),
+            Some(Popup::ConfirmDelete { dir, items }) => {
+                if matches!(k.code, KeyCode::Char('y' | 'Y')) {
+                    let fs = app.panes[app.focus.idx()].fs.clone();
+                    self.op(app.focus, None, async move {
+                        // Every item is tried; the last error is the one shown.
+                        let mut result = Ok(());
+                        for e in items {
+                            if let Err(err) = fs.remove_all(&join(&dir, &e.name)).await {
+                                result = Err(err);
+                            }
+                        }
+                        result
+                    });
+                }
+            }
             None if !app.conflicts.is_empty() => {
                 let r = match k.code {
                     KeyCode::Char('o') => Resolution::Overwrite,
@@ -226,8 +273,18 @@ impl Controller {
             None => {
                 // A message stays until the next key; whatever this key causes sets its own.
                 app.status.clear();
-                if let Some(cmd) = key_to_command(k) {
-                    self.apply(app, cmd);
+                match k.code {
+                    // A count: `15` then ↓ moves 15 rows. The status line shows it meanwhile.
+                    KeyCode::Char(c @ '0'..='9') if !ctrl && (app.count > 0 || c != '0') => {
+                        let d = c as usize - '0' as usize;
+                        app.count = (app.count * 10 + d).min(99_999);
+                    }
+                    _ => {
+                        if let Some(cmd) = key_to_command(k) {
+                            self.apply(app, cmd);
+                        }
+                        app.count = 0;
+                    }
                 }
             }
         }
@@ -331,20 +388,24 @@ impl Controller {
         match kind {
             InputKind::NewDir { .. } | InputKind::NewFile { .. } if value.is_empty() => {}
             InputKind::NewDir { dir } | InputKind::NewFile { dir } => {
-                let (path, tx) = (join(&dir, &value), self.tx.clone());
-                self.rt.spawn(async move {
-                    let result = match mk {
+                let path = join(&dir, &value);
+                self.op(side, Some(value), async move {
+                    match mk {
                         true => fs.mkdir(&path).await,
                         false => fs.create_new(&path).await,
-                    };
-                    let select = Some(value);
-                    let _ = tx.send(AppEvent::OpDone {
-                        side,
-                        select,
-                        result,
-                    });
+                    }
                 });
             }
+            InputKind::Rename { .. } if value.trim().is_empty() => {}
+            // A path moves it, on the same side: `../x`, `~/x`.
+            InputKind::Rename { dir, from } => {
+                let (src, dst) = (join(&dir, &from), resolve_path(&value, &dir, &fs.home()));
+                if src != dst {
+                    let select = parent(&dst).map(|(_, n)| n);
+                    self.op(side, select, async move { fs.rename_new(&src, &dst).await });
+                }
+            }
+            InputKind::Filter => {} // applied as typed
             InputKind::ChangeDir { base } => {
                 let path = resolve_path(&value, &base, &fs.home());
                 self.load(app, side, path, None);
@@ -369,15 +430,16 @@ impl Controller {
         use Command::*;
         let side = app.focus;
         let page = app.hit.panes[side.idx()].height as isize;
+        let n = app.count.max(1) as isize;
         let p = &mut app.panes[side.idx()];
         if matches!(cmd, CursorUp | CursorDown | PageUp | PageDown | Home | End) {
             p.clear_marks(); // moving without Shift ends the selection
         }
         match cmd {
-            CursorUp => p.move_cursor(-1, false),
-            CursorDown => p.move_cursor(1, false),
-            ExtendUp => p.move_cursor(-1, true),
-            ExtendDown => p.move_cursor(1, true),
+            CursorUp => p.move_cursor(-n, false),
+            CursorDown => p.move_cursor(n, false),
+            ExtendUp => p.move_cursor(-n, true),
+            ExtendDown => p.move_cursor(n, true),
             PageUp => p.move_cursor(-page, false),
             PageDown => p.move_cursor(page, false),
             Home => p.cursor_to(0),
@@ -436,11 +498,48 @@ impl Controller {
                 let base = p.cwd.clone();
                 app.popup = input(InputKind::ChangeDir { base }, "Change Dir", p.cwd.clone());
             }
+            Delete => {
+                let items = p.selection();
+                match items.is_empty() {
+                    true => app.status = "Nothing selected".into(),
+                    false => {
+                        let dir = p.cwd.clone();
+                        app.popup = Some(Popup::ConfirmDelete { dir, items });
+                    }
+                }
+            }
+            Rename => match p.current() {
+                Some(e) if e.name != ".." => {
+                    let (from, dir) = (e.name.clone(), p.cwd.clone());
+                    let value = from.clone();
+                    app.popup = input(InputKind::Rename { dir, from }, "Rename", value);
+                }
+                _ => app.status = "Nothing selected".into(),
+            },
+            Filter => app.popup = input(InputKind::Filter, "Filter", p.filter.clone()),
             Help => app.popup = Some(Popup::Help),
             Refresh => self.reload(app, side),
             Quit if app.transfers.jobs.is_empty() => app.quit = true,
             Quit => app.popup = Some(Popup::ConfirmQuit),
         }
+    }
+
+    /// A one-off fs call; its OpDone reloads `side` with the cursor on `select`.
+    fn op(
+        &self,
+        side: Side,
+        select: Option<String>,
+        f: impl Future<Output = Result<(), String>> + Send + 'static,
+    ) {
+        let tx = self.tx.clone();
+        self.rt.spawn(async move {
+            let result = f.await;
+            let _ = tx.send(AppEvent::OpDone {
+                side,
+                select,
+                result,
+            });
+        });
     }
 
     pub fn load(&mut self, app: &mut App, side: Side, path: String, select: Option<String>) {
@@ -707,6 +806,9 @@ mod tests {
             (K::Char('n'), none, NewDir),
             (K::Char('N'), shift, NewFile),
             (K::Char('g'), none, ChangeDir),
+            (K::Char('d'), none, Delete),
+            (K::Char('r'), none, Rename),
+            (K::Char('f'), none, Filter),
             (K::Char('?'), shift, Help),
             (K::Char('r'), KeyModifiers::CONTROL, Refresh),
             (K::Char('q'), none, Quit),
@@ -752,6 +854,135 @@ mod tests {
         press_mod(&mut t, KeyCode::Up, KeyModifiers::SHIFT);
         press(&mut t, KeyCode::End);
         assert!(t.app.panes[0].marked.is_empty());
+    }
+
+    #[test]
+    fn count_prefix_moves_n_rows() {
+        let names: Vec<String> = (10..40).map(|i| format!("f{i}")).collect();
+        let mut t = setup(&names.iter().map(|s| s.as_str()).collect::<Vec<_>>(), &[]);
+        typ(&mut t, "15");
+        assert_eq!(t.app.count, 15);
+        press(&mut t, KeyCode::Down);
+        assert_eq!(t.app.panes[0].cursor, 15);
+        press(&mut t, KeyCode::Down); // the count was used up
+        assert_eq!(t.app.panes[0].cursor, 16);
+        typ(&mut t, "3");
+        press_mod(&mut t, KeyCode::Up, KeyModifiers::SHIFT);
+        assert_eq!(t.app.panes[0].cursor, 13);
+        assert_eq!(t.app.panes[0].marked.len(), 4);
+        typ(&mut t, "5");
+        press(&mut t, KeyCode::Esc); // any other key drops it
+        press(&mut t, KeyCode::Down);
+        assert_eq!(t.app.panes[0].cursor, 14);
+        typ(&mut t, "0"); // a leading 0 is no count
+        assert_eq!((t.app.count, t.app.status.as_str()), (0, ""));
+        typ(&mut t, "999");
+        press(&mut t, KeyCode::Down);
+        assert_eq!(t.app.panes[0].cursor, 30); // clamped to the last row
+    }
+
+    #[test]
+    fn delete_asks_then_removes_files_and_folders() {
+        let mut t = setup(&["a", "d/", "d/x", "keep"], &[]);
+        press(&mut t, KeyCode::Char('d')); // on ..
+        assert!(t.app.popup.is_none());
+        assert_eq!(t.app.status, "Nothing selected");
+        select(&mut t, "d");
+        press_mod(&mut t, KeyCode::Down, KeyModifiers::SHIFT); // d, a
+        press(&mut t, KeyCode::Char('d'));
+        assert!(
+            matches!(&t.app.popup, Some(Popup::ConfirmDelete { items, .. }) if items.len() == 2)
+        );
+        press(&mut t, KeyCode::Char('n'));
+        assert!(t.app.popup.is_none());
+        assert!(exists(join(&t.dirs[0], "a")));
+        press(&mut t, KeyCode::Char('d'));
+        press(&mut t, KeyCode::Char('y'));
+        pump(&mut t, |a| names(&a.panes[0]) == ["..", "keep"]);
+        assert!(!exists(join(&t.dirs[0], "d")));
+        assert!(!exists(join(&t.dirs[0], "a")));
+    }
+
+    #[test]
+    fn delete_failure_reports_and_reloads() {
+        let mut t = setup(&["a", "b"], &[]);
+        select(&mut t, "a");
+        std::fs::remove_file(join(&t.dirs[0], "a")).unwrap(); // gone behind our back
+        press(&mut t, KeyCode::Char('d'));
+        press(&mut t, KeyCode::Char('y'));
+        pump(&mut t, |a| !a.status.is_empty() && lists(a, Left, &["b"]));
+        pump(&mut t, |a| !names(&a.panes[0]).contains(&"a"));
+        assert!(t.app.status.contains("/a"), "{}", t.app.status);
+    }
+
+    #[test]
+    fn rename_flow_refuses_existing_name() {
+        let mut t = setup(&["a", "b"], &[]);
+        select(&mut t, "a");
+        press(&mut t, KeyCode::Char('r'));
+        assert_eq!(input(&t.app), ("Rename", "a"));
+        press(&mut t, KeyCode::Backspace);
+        typ(&mut t, "c");
+        press(&mut t, KeyCode::Enter);
+        pump(&mut t, |a| {
+            a.panes[0].current().is_some_and(|e| e.name == "c")
+        });
+        assert!(!exists(join(&t.dirs[0], "a")));
+        press(&mut t, KeyCode::Char('r'));
+        press_mod(&mut t, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        typ(&mut t, "b");
+        press(&mut t, KeyCode::Enter);
+        pump(&mut t, |a| !a.status.is_empty());
+        assert!(t.app.status.contains("already exists"), "{}", t.app.status);
+        assert_eq!(std::fs::read_to_string(join(&t.dirs[0], "b")).unwrap(), "b");
+        assert!(exists(join(&t.dirs[0], "c")));
+    }
+
+    #[test]
+    fn refused_rename_keeps_the_cursor_on_its_file() {
+        let mut t = setup(&["a", "b", "c"], &[]);
+        select(&mut t, "a");
+        press(&mut t, KeyCode::Char('r'));
+        press_mod(&mut t, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        typ(&mut t, "c");
+        press(&mut t, KeyCode::Enter);
+        pump(&mut t, |a| {
+            !a.status.is_empty() && a.panes[0].loading.is_none()
+        });
+        assert!(t.app.status.contains("already exists"), "{}", t.app.status);
+        assert_eq!(t.app.panes[0].current().unwrap().name, "a");
+    }
+
+    #[test]
+    fn listing_landing_under_the_open_bar_takes_its_filter() {
+        let mut t = setup(&["sub/", "sub/xa", "sub/yb", "xold"], &[]);
+        select(&mut t, "sub");
+        press(&mut t, KeyCode::Enter); // the load is in flight
+        press(&mut t, KeyCode::Char('f'));
+        typ(&mut t, "x");
+        pump(&mut t, |a| a.panes[0].cwd.ends_with("/sub"));
+        assert_eq!(names(&t.app.panes[0]), ["..", "xa"]);
+        press(&mut t, KeyCode::Enter);
+        assert_eq!(t.app.panes[0].filter, "x");
+    }
+
+    #[test]
+    fn filter_live_enter_keeps_esc_clears() {
+        let mut t = setup(&["apple", "banana", "cherry"], &[]);
+        press(&mut t, KeyCode::Char('f'));
+        typ(&mut t, "AN1");
+        assert_eq!(names(&t.app.panes[0]), [".."]);
+        press(&mut t, KeyCode::Backspace);
+        assert_eq!(names(&t.app.panes[0]), ["..", "banana"]);
+        assert_eq!(t.app.count, 0); // digits in the bar are text
+        press(&mut t, KeyCode::Enter);
+        assert!(t.app.popup.is_none());
+        assert_eq!(t.app.panes[0].filter, "AN");
+        press(&mut t, KeyCode::Char('f'));
+        assert_eq!(input(&t.app), ("Filter", "AN"));
+        press(&mut t, KeyCode::Esc);
+        assert_eq!(t.app.panes[0].filter, "");
+        assert_eq!(names(&t.app.panes[0]).len(), 4);
     }
 
     #[test]
@@ -1265,7 +1496,11 @@ mod tests {
         // Some terminals report no motion: a press here and a release there is still a drag.
         down(&mut t, from);
         assert!(t.app.drag.as_ref().unwrap().at.is_none());
-        mouse(&mut t, MouseEventKind::Up(MouseButton::Left), (title.x + 3, title.y));
+        mouse(
+            &mut t,
+            MouseEventKind::Up(MouseButton::Left),
+            (title.x + 3, title.y),
+        );
         pump(&mut t, |a| lists(a, Right, &["a.txt"]));
         assert_eq!(t.app.status, "Copied 1 item(s)");
     }

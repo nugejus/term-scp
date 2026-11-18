@@ -1,0 +1,64 @@
+#compdef term-scp
+# zsh completion for term-scp, including remote folders over ssh.
+# Install: put this line in ~/.zshrc before `compinit` runs:
+#   fpath=(/path/to/term-scp/completions $fpath)
+
+local curcontext=$curcontext state line host expl ret=1
+local -A opt_args
+
+# -l and a second HOST:DIR exclude each other.
+_arguments -C -S \
+  '(- : *)'{-h,--help}'[print help]' \
+  '(- : *)'{-V,--version}'[print version]' \
+  '(-P --port)'{-P+,--port=}'[ssh port]:port' \
+  '(-i --identity)'{-i+,--identity=}'[ssh identity file]:identity file:_files' \
+  '*'{-o+,--ssh-option=}'[extra ssh option]:ssh option' \
+  '(-l --local 2)'{-l+,--local=}'[folder the local pane starts in]:local folder:_files -/' \
+  '--no-icons[no file icons]' \
+  '1:HOST\:DIR:->target' \
+  '(-l --local)2:second HOST\:DIR (no local pane):->target' && ret=0
+
+case $state in
+  target)
+    host=${(Q)PREFIX%%:*}
+    if compset -P '*:'; then
+      # Not _remote_files: it quotes for scp's remote shell, and term-scp takes the path as is.
+      local rpath=${(Q)PREFIX} dir= arg globs='*' i w
+      local -a sshopt dirs
+      [[ $rpath == */* ]] && dir=${rpath%/*}/
+      [[ ${rpath##*/} == .* ]] && globs='.[!.]* ..?*' # hidden folders only once a '.' is typed
+      case $dir in
+        '') arg=. ;;
+        '~/'*) arg="~/${(qq)${dir#\~/}}" ;; # (qq): single quotes, as sh reads them
+        *) arg=${(qq)dir} ;;
+      esac
+      # the line's -P / -i / -o, as term-scp passes them to ssh
+      for (( i = 2; i < CURRENT; i++ )); do
+        w=${(Q)words[i]}
+        case $w in
+          -P|--port) sshopt+=(-p ${(Q)words[i+1]}); (( i++ )) ;;
+          -i|--identity) sshopt+=(-i ${(Q)words[i+1]}); (( i++ )) ;;
+          -o|--ssh-option) sshopt+=(-o ${(Q)words[i+1]}); (( i++ )) ;;
+          --port=*) sshopt+=(-p ${w#*=}) ;;
+          --identity=*) sshopt+=(-i ${w#*=}) ;;
+          --ssh-option=*) sshopt+=(-o ${w#*=}) ;;
+        esac
+      done
+      # BatchMode: never prompt; ConnectTimeout: Tab gives up in ~3 s when the host is unreachable.
+      dirs=(${(f)"$(command ssh -o BatchMode=yes -o ConnectTimeout=3 $sshopt $host \
+        "cd $arg 2>/dev/null && for x in $globs; do [ -d \"\$x\" ] && printf '%s\\n' \"\$x\"; done" \
+        </dev/null 2>/dev/null)"})
+      compset -P '*/'
+      _wanted directories expl 'remote folder' compadd -S / -- $dirs && ret=0
+    else
+      local key rest
+      local -a hosts
+      [[ -r ~/.ssh/config ]] && while read -r key rest; do
+        [[ ${(L)key} == host ]] && hosts+=(${=rest})
+      done < ~/.ssh/config
+      _wanted hosts expl host compadd -S : -- ${hosts:#(*[*?]*|!*)} && ret=0
+    fi
+    ;;
+esac
+
+return ret
