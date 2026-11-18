@@ -60,6 +60,19 @@ pub const TOOLBAR: [(&str, Command); 6] = [
     ("Change Dir", Command::ChangeDir),
 ];
 
+/// The right-click menu: (label, key, command). Each item does what its key does.
+pub const MENU: [(&str, &str, Command); 9] = [
+    ("Copy", "c", Command::QuickCopy),
+    ("Copy to…", "C", Command::CopyTo),
+    ("Move to…", "m", Command::Move),
+    ("Rename", "r", Command::Rename),
+    ("Delete", "d", Command::Delete),
+    ("New dir", "n", Command::NewDir),
+    ("New file", "N", Command::NewFile),
+    ("Change dir", "g", Command::ChangeDir),
+    ("Filter", "f", Command::Filter),
+];
+
 pub struct Pane {
     pub fs: Fs,
     pub cwd: String,
@@ -251,6 +264,10 @@ pub enum Popup {
         dir: String,
         items: Vec<Entry>,
     },
+    Menu {
+        at: Position,  // where it was right-clicked
+        cursor: usize, // index into MENU
+    },
 }
 pub struct ConflictPrompt {
     pub job: JobId,
@@ -316,6 +333,7 @@ pub struct Hit {
     pub panes: [Rect; 2],   // inner row areas
     pub boxes: [Rect; 2],   // whole pane boxes, border and title included: the drop zones
     pub toolbar: Vec<Rect>, // toolbar[i] <-> TOOLBAR[i]
+    pub menu: Rect,         // the open menu's rows: row i <-> MENU[i]
 }
 pub struct Drag {
     pub from: Side,

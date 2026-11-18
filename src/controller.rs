@@ -1,6 +1,6 @@
 use crate::fs::{Entry, Fs, join, parent, resolve_path};
 use crate::model::{
-    App, Command, ConflictPrompt, Drag, InputKind, JobProgress, Popup, Side, TOOLBAR,
+    App, Command, ConflictPrompt, Drag, InputKind, JobProgress, MENU, Popup, Side, TOOLBAR,
 };
 use crate::transfer::{self, Emit, Job, JobId, Resolution, TransferEvent};
 use ratatui::crossterm::event::{
@@ -242,6 +242,18 @@ impl Controller {
                 });
             }
             Some(Popup::Help) => {}
+            Some(Popup::Menu { at, cursor }) => match k.code {
+                KeyCode::Up | KeyCode::Down => {
+                    let cursor = match k.code {
+                        KeyCode::Up => cursor.saturating_sub(1),
+                        _ => (cursor + 1).min(MENU.len() - 1),
+                    };
+                    app.popup = Some(Popup::Menu { at, cursor });
+                }
+                KeyCode::Enter => self.apply(app, MENU[cursor].2),
+                KeyCode::Esc => {}
+                _ => self.on_key(app, k), // the key shown beside an item works as always
+            },
             Some(Popup::ConfirmQuit) => app.quit = matches!(k.code, KeyCode::Char('y' | 'Y')),
             Some(Popup::ConfirmDelete { dir, items }) => {
                 if matches!(k.code, KeyCode::Char('y' | 'Y')) {
@@ -296,11 +308,44 @@ impl Controller {
             MouseEventKind::Up(_) => app.drag.take(),
             _ => None,
         };
+        let pos = Position::new(m.column, m.row);
+        if let Some(Popup::Menu { cursor, .. }) = &mut app.popup {
+            let menu = app.hit.menu;
+            let row = menu.contains(pos).then(|| (pos.y - menu.y) as usize);
+            match (m.kind, row) {
+                (MouseEventKind::Moved, Some(i)) => *cursor = i,
+                (MouseEventKind::Down(MouseButton::Left), Some(i)) => {
+                    app.popup = None;
+                    return self.apply(app, MENU[i].2);
+                }
+                // A right-click elsewhere opens the menu there (below); other clicks just close it.
+                (MouseEventKind::Down(MouseButton::Right), None) => app.popup = None,
+                (MouseEventKind::Down(_), _) => {
+                    app.popup = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
         if app.popup.is_some() || !app.conflicts.is_empty() {
             return;
         }
-        let pos = Position::new(m.column, m.row);
         match m.kind {
+            MouseEventKind::Down(MouseButton::Right) => {
+                let Some((s, row)) = under(app, pos) else {
+                    return;
+                };
+                app.focus = s;
+                if let Some(idx) = row {
+                    // The menu acts on the clicked row, or on the marks when it is one of them.
+                    let p = &mut app.panes[s.idx()];
+                    if !p.marked.contains(&p.entries[idx].name) {
+                        p.clear_marks();
+                    }
+                    p.cursor_to(idx);
+                }
+                app.popup = Some(Popup::Menu { at: pos, cursor: 0 });
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(i) = app.hit.toolbar.iter().position(|r| r.contains(pos)) {
                     return self.apply(app, TOOLBAR[i].1);
@@ -1367,6 +1412,66 @@ mod tests {
         down(&mut t, sub);
         pump(&mut t, |a| a.panes[0].cwd.ends_with("/sub"));
         assert_eq!(names(&t.app.panes[0]), ["..", "x"]);
+    }
+
+    #[test]
+    fn menu_items_show_their_own_key() {
+        for (label, key, cmd) in MENU {
+            let k = KeyEvent::new(
+                KeyCode::Char(key.chars().next().unwrap()),
+                KeyModifiers::NONE,
+            );
+            assert_eq!(key_to_command(k), Some(cmd), "{label}");
+        }
+    }
+
+    #[test]
+    fn right_click_menu_acts_on_the_clicked_row_or_the_marks() {
+        let mut t = setup(&["a.txt", "b.txt", "c.txt"], &[]);
+        draw(&mut t);
+        let right = |t: &mut T, at| mouse(t, MouseEventKind::Down(MouseButton::Right), at);
+        let (a, c) = (at(&t, Left, "a.txt"), at(&t, Left, "c.txt"));
+        t.app.panes[0].marked = ["a.txt", "b.txt"].map(String::from).into();
+        right(&mut t, a); // a marked row: the menu acts on the marks
+        assert_eq!(t.app.panes[0].marked.len(), 2);
+        assert!(matches!(t.app.popup, Some(Popup::Menu { cursor: 0, .. })));
+        press(&mut t, KeyCode::Char('d')); // an item's key works with the menu open
+        assert!(
+            matches!(&t.app.popup, Some(Popup::ConfirmDelete { items, .. }) if items.len() == 2)
+        );
+        press(&mut t, KeyCode::Esc);
+
+        right(&mut t, c); // an unmarked row: only that one
+        assert!(t.app.panes[0].marked.is_empty());
+        assert_eq!(t.app.panes[0].current().unwrap().name, "c.txt");
+        draw(&mut t);
+        let m = t.app.hit.menu;
+        mouse(&mut t, MouseEventKind::Moved, (m.x + 2, m.y + 4));
+        assert!(matches!(t.app.popup, Some(Popup::Menu { cursor: 4, .. })));
+        down(&mut t, (m.x + 2, m.y + 4)); // Delete
+        assert!(
+            matches!(&t.app.popup, Some(Popup::ConfirmDelete { items, .. })
+            if items.len() == 1 && items[0].name == "c.txt")
+        );
+    }
+
+    #[test]
+    fn menu_arrows_enter_and_a_click_elsewhere() {
+        let mut t = setup(&["a.txt"], &[]);
+        draw(&mut t);
+        let a = at(&t, Left, "a.txt");
+        mouse(&mut t, MouseEventKind::Down(MouseButton::Right), a);
+        press(&mut t, KeyCode::Down);
+        press(&mut t, KeyCode::Down);
+        press(&mut t, KeyCode::Enter);
+        assert_eq!(input(&t.app).0, "Move to");
+        press(&mut t, KeyCode::Esc);
+
+        mouse(&mut t, MouseEventKind::Down(MouseButton::Right), a);
+        draw(&mut t);
+        let new_dir = t.app.hit.toolbar[0];
+        down(&mut t, (new_dir.x, new_dir.y)); // only closes the menu
+        assert!(t.app.popup.is_none());
     }
 
     #[test]

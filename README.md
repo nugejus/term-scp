@@ -87,6 +87,8 @@ The selection is the marked files, or the file under the cursor when nothing is 
 
 The toolbar buttons do what their keys do. Everything is also clickable; double-click opens a folder, and the wheel moves the cursor in the pane under the pointer without focusing it. Drag a file onto the other pane to copy it into that pane's folder, or onto a folder row other than `..` to copy into that folder. Its dimmed name follows the pointer. Dragging a marked file takes all marked files.
 
+Right-click a file for a menu: copy, copy to, move, rename, delete, new folder, new file, change folder and filter, each with its key beside it. It acts on that file, or on all marked files when it is one of them. Pick with the mouse, `↑` `↓` `Enter` or the key; `Esc` or a click elsewhere closes it. Some terminals keep right-click for their own menu; turn that off to get this one.
+
 ## Copy to and Move
 
 `Shift` `C` and `m` open a line with the destination filled in: `<other pane's folder>/<name>` for one file, the other pane's folder for several. The box is a third of the screen wide; a long path wraps.

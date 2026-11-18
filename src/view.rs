@@ -1,8 +1,8 @@
 use crate::icons::icon;
-use crate::model::{App, InputKind, Popup, Side, TOOLBAR, Transfers};
+use crate::model::{App, InputKind, MENU, Popup, Side, TOOLBAR, Transfers};
 use chrono::{Datelike, Local, TimeZone};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -38,6 +38,7 @@ const HELP: [(&str, &str); 22] = [
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.hit.toolbar.clear();
+    app.hit.menu = Rect::default();
     let [top, mid, bottom] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
@@ -155,6 +156,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             }
             popup(f, "Delete", lines, 0);
         }
+        &Some(Popup::Menu { at, cursor }) => app.hit.menu = draw_menu(f, at, cursor),
         None => {
             if let Some(c) = app.conflicts.front() {
                 let head = format!("Job {}: file exists: ", c.job);
@@ -314,16 +316,45 @@ fn popup(f: &mut Frame, title: &str, lines: Vec<Line>, min_w: usize) {
         .bg(Color::Reset)
         .remove_modifier(Modifier::all());
     f.buffer_mut().set_style(full, backdrop);
-    let accent = Style::new()
-        .fg(Color::LightCyan)
-        .add_modifier(Modifier::BOLD);
-    let block = Block::bordered()
-        .border_type(BorderType::Thick)
-        .border_style(accent)
-        .title(Span::styled(format!(" {title} "), accent))
-        .padding(Padding::horizontal(1));
+    let block = frame().title(Span::styled(format!(" {title} "), ACCENT));
     f.render_widget(Clear, r);
     f.render_widget(Paragraph::new(lines).block(block), r);
+}
+
+const ACCENT: Style = Style::new()
+    .fg(Color::LightCyan)
+    .add_modifier(Modifier::BOLD);
+
+/// The accent frame of every popup.
+fn frame() -> Block<'static> {
+    Block::bordered()
+        .border_type(BorderType::Thick)
+        .border_style(ACCENT)
+        .padding(Padding::horizontal(1))
+}
+
+/// The right-click menu beside the pointer, moved back on screen near an edge. Returns its rows.
+fn draw_menu(f: &mut Frame, at: Position, cursor: usize) -> Rect {
+    let lines: Vec<Line> = MENU
+        .iter()
+        .enumerate()
+        .map(|(i, (label, key, _))| {
+            let line = Line::from(format!("{label:<10}  {key}"));
+            match i == cursor {
+                true => line.style(Modifier::REVERSED),
+                false => line,
+            }
+        })
+        .collect();
+    let full = f.area();
+    let w = (lines[0].width() as u16 + 4).min(full.width);
+    let h = (lines.len() as u16 + 2).min(full.height);
+    let x = at.x.saturating_add(1).min(full.right().saturating_sub(w));
+    let y = at.y.min(full.bottom().saturating_sub(h));
+    let r = Rect::new(x, y, w, h);
+    f.render_widget(Clear, r);
+    f.render_widget(Paragraph::new(lines).block(frame()), r);
+    r.inner(Margin::new(1, 1))
 }
 
 /// The dragged items' name at the pointer, dimmed over whatever is beneath (its background
@@ -791,6 +822,20 @@ mod tests {
         t.draw(|f| draw(f, &mut a)).unwrap();
         assert_eq!(a.hit.toolbar.len(), 6);
         assert!(a.hit.panes[1].x > a.hit.panes[0].x);
+    }
+
+    #[test]
+    fn menu_stays_on_screen_near_the_edge() {
+        let mut a = app("/d", vec![]);
+        a.popup = Some(Popup::Menu {
+            at: ratatui::layout::Position::new(79, 11),
+            cursor: 0,
+        });
+        let b = render(&mut a, 80, 12);
+        let m = a.hit.menu;
+        assert_eq!((m.right() + 1, m.bottom() + 1), (80, 12)); // pushed back in, frame included
+        assert_eq!(m.height as usize, MENU.len().min(10));
+        assert!(row(&b, m.y).contains("Copy"), "{}", row(&b, m.y));
     }
 
     #[test]
