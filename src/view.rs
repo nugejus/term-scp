@@ -52,16 +52,28 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         width: top.right().saturating_sub(x),
         ..top
     };
-    let progress = progress_line(&app.transfers, rest.width as usize);
-    f.render_widget(Line::from(progress).right_aligned(), rest);
+    // Ruling R7: under 16 cells the progress line moves to the status line.
+    let progress_in_toolbar = rest.width >= 16;
+    if progress_in_toolbar {
+        let progress = progress_line(&app.transfers, rest.width as usize);
+        f.render_widget(Line::from(progress).right_aligned(), rest);
+    }
 
     let halves: [Rect; 2] = Layout::horizontal([Constraint::Fill(1); 2]).areas(mid);
     for side in [Side::Left, Side::Right] {
         app.hit.panes[side.idx()] = draw_pane(f, app, side, halves[side.idx()]);
     }
 
+    let right = match &app.drag {
+        Some(d) if d.active => format!("Drop to copy {} item(s)", d.items.len()),
+        _ => app.status.clone(),
+    };
     let p = &app.panes[app.focus.idx()];
-    let left = if p.marked.is_empty() {
+    let left = if !progress_in_toolbar && app.transfers.running() > 0 {
+        let full = bottom.width as usize;
+        let w = full.saturating_sub(right.width() + 1).max(16).min(full);
+        progress_line(&app.transfers, w)
+    } else if p.marked.is_empty() {
         String::new()
     } else {
         let sum = p
@@ -70,10 +82,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             .filter(|e| !e.is_dir && p.marked.contains(&e.name));
         let sum = sum.map(|e| e.size).sum();
         format!("{} marked · {}", p.marked.len(), human_size(sum))
-    };
-    let right = match &app.drag {
-        Some(d) if d.active => format!("Drop to copy {} item(s)", d.items.len()),
-        _ => app.status.clone(),
     };
     let gap = (left.width() as u16).saturating_add(1);
     f.render_widget(Line::from(left), bottom);
@@ -299,24 +307,40 @@ pub fn progress_line(t: &Transfers, width: usize) -> String {
         return String::new();
     }
     let (done, total) = t.totals();
-    let frac = if total == 0 {
-        0.0
-    } else {
-        (done as f64 / total as f64).min(1.0)
+    let pct = (done.min(total) as f64 * 100.0 / total.max(1) as f64) as usize;
+    let bar = "█".repeat(pct / 10) + &"░".repeat(10 - pct / 10);
+    let speed = human_size(t.speed as u64);
+    let plus = match t.queued() {
+        0 => String::new(),
+        q => format!(" +{q}"),
     };
-    let fill = (frac * 10.0).round() as usize;
-    let bar = "█".repeat(fill) + &"░".repeat(10usize.saturating_sub(fill));
-    let (pct, speed) = ((frac * 100.0) as u32, human_size(t.speed as u64));
-    let mut s = match t.jobs.values().find(|j| j.started) {
-        Some(j) if n == 1 => format!(
-            "⇅ {} {bar} {pct}% {speed}/s {}/{}",
-            j.current, j.done_files, j.total_files
+    let (label, files) = match t.jobs.values().find(|j| j.started) {
+        Some(j) if n == 1 => (
+            j.current.clone(),
+            format!(" {}/{}", j.done_files, j.total_files),
         ),
-        _ => format!("⇅ {n} jobs {bar} {pct}% {speed}/s"),
+        _ => (format!("{n} jobs"), String::new()),
     };
-    if t.queued() > 0 {
-        s += &format!(" +{}", t.queued());
-    }
+    // Narrow: drop speed, then file counts, then the queued count; the bar and % stay.
+    let tails = [
+        format!("{bar} {pct}% {speed}/s{files}{plus}"),
+        format!("{bar} {pct}%{files}{plus}"),
+        format!("{bar} {pct}%{plus}"),
+        format!("{bar} {pct}%"),
+    ];
+    let tail = tails.iter().find(|s| s.width() + 2 <= width);
+    let tail = tail.unwrap_or(&tails[3]);
+    let room = width.saturating_sub(tail.width() + 3);
+    let fits = if n == 1 {
+        room >= 4
+    } else {
+        room >= label.width()
+    };
+    let s = if fits {
+        format!("⇅ {} {tail}", fit_left(&label, room))
+    } else {
+        format!("⇅ {tail}")
+    };
     let mut w = 0;
     s.chars()
         .take_while(|c| {
@@ -422,6 +446,40 @@ mod tests {
         t.jobs.insert(3, JobProgress::default());
         let s = progress_line(&t, 200);
         assert!(s.contains("2 jobs") && s.contains("+1"), "{s}");
+    }
+
+    #[test]
+    fn narrow_progress_keeps_bar_and_percent() {
+        let mut t = Transfers::default();
+        t.jobs.insert(1, job("train_data_2024.mp4"));
+        let s = progress_line(&t, 22);
+        assert!(s.width() <= 22 && s.contains('%') && s.contains('█'), "{s}");
+        let s = progress_line(&t, 40);
+        assert!(
+            s.contains("…") && s.ends_with("1/2") && s.contains(".mp4"),
+            "{s}"
+        );
+        t.jobs.get_mut(&1).unwrap().done_bytes = 99;
+        let s = progress_line(&t, 80);
+        assert!(s.contains("99%") && s.matches('█').count() == 9, "{s}");
+    }
+
+    #[test]
+    fn narrow_terminal_shows_progress_in_status_line() {
+        let mut a = app("/d", vec![]);
+        a.transfers.jobs.insert(1, job("a.mp4"));
+        let b = render(&mut a, 60, 10);
+        let r = row(&b, 9);
+        assert!(r.contains('%') && r.contains('█'), "{r}");
+    }
+
+    #[test]
+    fn offset_written_back() {
+        let names: Vec<String> = (0..30).map(|i| format!("f{i:02}")).collect();
+        let mut a = app("/d", names.iter().map(|n| file(n, 1)).collect());
+        a.panes[0].cursor_to(29);
+        render(&mut a, 80, 12);
+        assert!(a.panes[0].offset > 0);
     }
 
     #[test]
