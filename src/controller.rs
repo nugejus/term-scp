@@ -242,10 +242,14 @@ impl Controller {
                 if let Some(i) = app.hit.toolbar.iter().position(|r| r.contains(pos)) {
                     return self.apply(app, TOOLBAR[i].1);
                 }
-                let Some((s, Some(idx))) = under(app, pos) else {
+                let Some((s, row)) = under(app, pos) else {
                     return;
                 };
+                // Blank space below the rows focuses too; only a row moves the cursor or drags.
                 app.focus = s;
+                let Some(idx) = row else {
+                    return;
+                };
                 let p = &mut app.panes[s.idx()];
                 p.cursor_to(idx);
                 // Fixed now, so a listing landing mid-drag can't change what is copied.
@@ -1068,6 +1072,17 @@ mod tests {
         down(&mut t, b);
         assert_eq!(t.app.focus, Right);
         assert_eq!(t.app.panes[1].current().unwrap().name, "b.txt");
+    }
+
+    #[test]
+    fn click_below_last_row_focuses_pane() {
+        let mut t = setup(&[], &["a.txt"]);
+        draw(&mut t);
+        let r = t.app.hit.panes[1];
+        down(&mut t, (r.x + 1, r.y + r.height - 1));
+        assert_eq!(t.app.focus, Right);
+        assert_eq!(t.app.panes[1].cursor, 0);
+        assert!(t.app.drag.is_none());
     }
 
     #[test]
