@@ -1,4 +1,5 @@
 #![allow(dead_code)] // ponytail: until Task 10 wires main
+mod controller;
 mod fs;
 mod icons;
 mod model;
