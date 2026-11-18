@@ -28,7 +28,13 @@ pub fn icon(name: &str, is_dir: bool) -> (&'static str, Color) {
         "html" | "htm" => ("\u{e736}", Color::Rgb(255, 135, 0)),
         "j2" => ("\u{e66f}", Color::Rgb(180, 80, 80)),
         "sh" | "bash" | "zsh" => ("\u{f489}", Color::Green),
-        _ if matches!(name, ".gitignore" | ".editorconfig" | "Dockerfile" | "Makefile") => ("\u{e615}", Color::DarkGray),
+        _ if matches!(
+            name,
+            ".gitignore" | ".editorconfig" | "Dockerfile" | "Makefile"
+        ) =>
+        {
+            ("\u{e615}", Color::DarkGray)
+        }
         _ => ("\u{f016}", Color::Gray),
     }
 }
@@ -40,8 +46,11 @@ mod tests {
 
     #[test]
     fn every_category_distinct() {
-        let names = ["x.mp4", "x.mp3", "x.csv", "x.txt", "x.py", "x.rs", "x.c", "x.cpp", "x.ts", "x.go", "x.js",
-            "x.java", "x.md", "x.toml", "x.yaml", "x.json", "x.conf", "x.html", "x.j2", "x.sh", "x.bin"];
+        let names = [
+            "x.mp4", "x.mp3", "x.csv", "x.txt", "x.py", "x.rs", "x.c", "x.cpp", "x.ts", "x.go",
+            "x.js", "x.java", "x.md", "x.toml", "x.yaml", "x.json", "x.conf", "x.html", "x.j2",
+            "x.sh", "x.bin",
+        ];
         let mut set: HashSet<&str> = names.iter().map(|n| icon(n, false).0).collect();
         set.insert(icon("d", true).0);
         assert_eq!(set.len(), 22);
