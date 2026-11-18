@@ -106,7 +106,7 @@ Delete and rename are out this round, but must be easy to add later.
 **Screen**
 
 ```
- [New Dir] [New File] [Move] [Copy to] [Change Dir] [Help]   ⇅ data.mp4 ███████░░░ 68% 12.3MB/s 2/5 +1
+ [New Dir] [New File] [Help] [Move] [Copy to] [Change Dir]   ⇅ data.mp4 ███████░░░ 68% 12.3MB/s 2/5 +1
 ┌ local:/Users/sli/term-scp ────────────┐┏ devbox22:/home/sli/proj ━━━━━━━━━━━━━┓
 │   ..                                  │┃   ..                                 ┃
 │   src                                 │┃   data                               ┃
@@ -180,7 +180,9 @@ Delete and rename are out this round, but must be easy to add later.
 - Filenames uploaded from macOS are normalized to Unicode NFC
   (`unicode-normalization`). Finder often produces NFD names, so Hangul
   names would otherwise show as separated jamo on Linux and miss conflict
-  checks against existing NFC names. Downloads keep names as-is.
+  checks against existing NFC names. Downloads keep names as-is. Only the
+  names of items being created are normalized; existing destination parent
+  dirs are used byte-for-byte (they may be NFD on the server).
 - File permission bits are preserved on copy; mtime is not (same as plain
   `scp`). Symlinks are followed (their target is listed and copied).
 - Transfers (user's choice: concurrent). Each `c`/`C`/Move/drag creates a
@@ -197,7 +199,9 @@ Delete and rename are out this round, but must be easy to add later.
   answered. "Overwrite all" and Cancel apply to that job only.
 
 **Connection**
-- Spawn `ssh [-P→-p port] [-i id] [-o opt]... <[user@]host> -s sftp` with
+- Spawn `ssh <mux opts> <scp's guard opts: ForwardX11=no ForwardAgent=no
+  PermitLocalCommand=no ClearAllForwardings=yes RemoteCommand=none
+  RequestTTY=no> [-P→-p port] [-i id] [-o opt]... -s <[user@]host> sftp` with
   stdin/stdout piped and stderr captured into a buffer.
 - Handshake (SFTP INIT) and resolving the start path happen **before** the
   TUI enters raw mode / alternate screen, so ssh's own prompts (password,
