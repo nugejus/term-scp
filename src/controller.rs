@@ -233,6 +233,8 @@ impl Controller {
                 let path = resolve_path(&value, &p.cwd, &p.fs.home());
                 self.load(app, side, path, None);
             }
+            // An emptied field would resolve to the other cwd and merge a dir into it.
+            InputKind::CopyTo { .. } if value.trim().is_empty() => {}
             InputKind::CopyTo { from, items, mv } => {
                 let (src, dst) = (&app.panes[from.idx()], &app.panes[from.other().idx()]);
                 let targets = copy_targets(&items, &src.cwd, &value, &dst.cwd, &dst.fs.home());
@@ -711,6 +713,19 @@ mod tests {
         press(&mut t, KeyCode::Enter);
         pump(&mut t, |a| lists(a, Right, &["a.txt.bak"]));
         assert_eq!(t.app.status, "Copied 1 item(s)");
+    }
+
+    #[test]
+    fn copy_to_empty_value_cancels() {
+        let mut t = setup(&["a.txt", "d/", "d/x"], &[]);
+        select(&mut t, "d");
+        press(&mut t, KeyCode::Char('m'));
+        press_mod(&mut t, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        typ(&mut t, "  ");
+        press(&mut t, KeyCode::Enter);
+        assert!(t.app.popup.is_none());
+        assert!(t.app.transfers.jobs.is_empty());
+        assert!(std::path::Path::new(&join(&t.dirs[0], "d/x")).exists());
     }
 
     #[test]
