@@ -224,6 +224,11 @@ impl Controller {
     }
 
     fn on_mouse(&mut self, app: &mut App, m: MouseEvent) {
+        // Any release ends the drag, even one the gate below swallows.
+        let released = match m.kind {
+            MouseEventKind::Up(_) => app.drag.take(),
+            _ => None,
+        };
         if app.popup.is_some() || !app.conflicts.is_empty() {
             return;
         }
@@ -240,7 +245,7 @@ impl Controller {
                 let p = &mut app.panes[s.idx()];
                 p.cursor_to(idx);
                 // Fixed now, so a listing landing mid-drag can't change what is copied.
-                let e = &p.entries[idx];
+                let (e, src_cwd) = (&p.entries[idx], p.cwd.clone());
                 let items = match () {
                     _ if p.marked.contains(&e.name) => p.selection(),
                     _ if e.name == ".." => vec![],
@@ -259,6 +264,7 @@ impl Controller {
                 app.drag = Some(Drag {
                     from: s,
                     items,
+                    src_cwd,
                     active: false,
                 });
             }
@@ -268,13 +274,13 @@ impl Controller {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                if let Some(d) = app.drag.take()
+                if let Some(d) = released
                     && d.active
                     && !d.items.is_empty()
                     && let Some((s, row)) = under(app, pos)
                     && s == d.from.other()
                 {
-                    let (src, dst) = (&app.panes[d.from.idx()], &app.panes[s.idx()]);
+                    let dst = &app.panes[s.idx()];
                     let target = match row.map(|i| &dst.entries[i]) {
                         Some(e) if e.is_dir && e.name != ".." => join(&dst.cwd, &e.name),
                         _ => dst.cwd.clone(),
@@ -282,7 +288,7 @@ impl Controller {
                     let pairs = d
                         .items
                         .iter()
-                        .map(|e| (join(&src.cwd, &e.name), join(&target, &e.name)));
+                        .map(|e| (join(&d.src_cwd, &e.name), join(&target, &e.name)));
                     self.submit_copy(app, d.from, pairs.collect(), false);
                 }
             }
@@ -1133,6 +1139,40 @@ mod tests {
         mouse(&mut t, MouseEventKind::Up(MouseButton::Left), to);
         pump(&mut t, |a| lists(a, Right, &["b.txt"]));
         assert_eq!(names(&t.app.panes[1]), ["..", "b.txt"]);
+    }
+
+    #[test]
+    fn drop_uses_cwd_captured_at_press() {
+        let mut t = setup(&["x", "sub/", "sub/x"], &[]);
+        draw(&mut t);
+        let (from, to) = (at(&t, Left, "x"), at(&t, Right, ".."));
+        down(&mut t, from);
+        // A navigation into sub/ (which has its own `x`) lands mid-drag.
+        let landed = AppEvent::Listed {
+            side: Left,
+            seq: t.app.panes[0].seq,
+            select: None,
+            result: Ok((join(&t.dirs[0], "sub"), vec![file("x")])),
+        };
+        t.ctl.handle(&mut t.app, landed);
+        mouse(&mut t, MouseEventKind::Drag(MouseButton::Left), to);
+        mouse(&mut t, MouseEventKind::Up(MouseButton::Left), to);
+        pump(&mut t, |a| lists(a, Right, &["x"]));
+        let got = std::fs::read_to_string(join(&t.dirs[1], "x")).unwrap();
+        assert_eq!(got, "x");
+    }
+
+    #[test]
+    fn release_while_gated_ends_drag_without_copy() {
+        let mut t = setup(&["a.txt"], &[]);
+        draw(&mut t);
+        let (from, to) = (at(&t, Left, "a.txt"), at(&t, Right, ".."));
+        down(&mut t, from);
+        mouse(&mut t, MouseEventKind::Drag(MouseButton::Left), to);
+        press(&mut t, KeyCode::Char('n'));
+        mouse(&mut t, MouseEventKind::Up(MouseButton::Left), to);
+        assert!(t.app.drag.is_none());
+        assert!(t.app.transfers.jobs.is_empty());
     }
 
     #[test]

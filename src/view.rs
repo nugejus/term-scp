@@ -573,6 +573,7 @@ mod tests {
                         a.drag = Some(Drag {
                             from: Side::Left,
                             items,
+                            src_cwd: "/d".into(),
                             active: true,
                         });
                     }

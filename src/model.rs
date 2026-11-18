@@ -269,6 +269,7 @@ pub struct Hit {
 pub struct Drag {
     pub from: Side,
     pub items: Vec<Entry>, // fixed at press time
+    pub src_cwd: String,   // likewise: a listing landing mid-drag can't move the sources
     pub active: bool,
 }
 pub struct App {
