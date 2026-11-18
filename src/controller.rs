@@ -1,10 +1,15 @@
 use crate::fs::{Entry, Fs, join, parent, resolve_path};
-use crate::model::{App, Command, ConflictPrompt, InputKind, JobProgress, Popup, Side};
+use crate::model::{
+    App, Command, ConflictPrompt, Drag, InputKind, JobProgress, Popup, Side, TOOLBAR,
+};
 use crate::transfer::{self, Emit, Job, JobId, Resolution, TransferEvent};
-use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Position;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 pub enum AppEvent {
@@ -90,6 +95,16 @@ fn byte_at(s: &str, char_idx: usize) -> usize {
     s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
 }
 
+/// The pane under `pos`, and the entry index under it (None below the last row).
+fn under(app: &App, pos: Position) -> Option<(Side, Option<usize>)> {
+    let s = [Side::Left, Side::Right]
+        .into_iter()
+        .find(|s| app.hit.panes[s.idx()].contains(pos))?;
+    let p = &app.panes[s.idx()];
+    let i = p.offset + (pos.y - app.hit.panes[s.idx()].y) as usize;
+    Some((s, (i < p.entries.len()).then_some(i)))
+}
+
 pub struct Controller {
     rt: tokio::runtime::Handle,
     tx: Sender<AppEvent>,
@@ -110,7 +125,8 @@ impl Controller {
     pub fn handle(&mut self, app: &mut App, ev: AppEvent) {
         match ev {
             AppEvent::Input(Event::Key(k)) => self.on_key(app, k),
-            AppEvent::Input(_) => {} // Mouse: Task 9. Resize: the next draw adapts.
+            AppEvent::Input(Event::Mouse(m)) => self.on_mouse(app, m),
+            AppEvent::Input(_) => {} // Resize: the next draw adapts.
             AppEvent::Listed {
                 side,
                 seq,
@@ -204,6 +220,83 @@ impl Controller {
                     self.apply(app, cmd);
                 }
             }
+        }
+    }
+
+    fn on_mouse(&mut self, app: &mut App, m: MouseEvent) {
+        if app.popup.is_some() || !app.conflicts.is_empty() {
+            return;
+        }
+        let pos = Position::new(m.column, m.row);
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(i) = app.hit.toolbar.iter().position(|r| r.contains(pos)) {
+                    return self.apply(app, TOOLBAR[i].1);
+                }
+                let Some((s, Some(idx))) = under(app, pos) else {
+                    return;
+                };
+                app.focus = s;
+                let p = &mut app.panes[s.idx()];
+                p.cursor_to(idx);
+                // Fixed now, so a listing landing mid-drag can't change what is copied.
+                let e = &p.entries[idx];
+                let items = match () {
+                    _ if p.marked.contains(&e.name) => p.selection(),
+                    _ if e.name == ".." => vec![],
+                    _ => vec![e.clone()],
+                };
+                let now = Instant::now();
+                match app.last_click {
+                    Some((t, ls, li))
+                        if (ls, li) == (s, idx) && now - t < Duration::from_millis(400) =>
+                    {
+                        app.last_click = None;
+                        self.apply(app, Command::Enter);
+                    }
+                    _ => app.last_click = Some((now, s, idx)),
+                }
+                app.drag = Some(Drag {
+                    from: s,
+                    items,
+                    active: false,
+                });
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(d) = &mut app.drag {
+                    d.active = true;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(d) = app.drag.take()
+                    && d.active
+                    && !d.items.is_empty()
+                    && let Some((s, row)) = under(app, pos)
+                    && s == d.from.other()
+                {
+                    let (src, dst) = (&app.panes[d.from.idx()], &app.panes[s.idx()]);
+                    let target = match row.map(|i| &dst.entries[i]) {
+                        Some(e) if e.is_dir && e.name != ".." => join(&dst.cwd, &e.name),
+                        _ => dst.cwd.clone(),
+                    };
+                    let pairs = d
+                        .items
+                        .iter()
+                        .map(|e| (join(&src.cwd, &e.name), join(&target, &e.name)));
+                    self.submit_copy(app, d.from, pairs.collect(), false);
+                }
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                if let Some((s, _)) = under(app, pos) {
+                    let delta = if m.kind == MouseEventKind::ScrollUp {
+                        -3
+                    } else {
+                        3
+                    };
+                    app.panes[s.idx()].move_cursor(delta, false);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -458,7 +551,6 @@ mod tests {
     use crate::model::Pane;
     use Side::*;
     use std::sync::mpsc::Receiver;
-    use std::time::Duration;
 
     // Field order = drop order: the runtime stops before the tempdirs go.
     struct T {
@@ -908,6 +1000,179 @@ mod tests {
         assert_eq!(input(&t.app).1, "");
         press(&mut t, KeyCode::Esc);
         assert!(t.app.popup.is_none());
+    }
+
+    /// Fills `app.hit` (and pane offsets) the way a real frame does.
+    fn draw(t: &mut T) {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| crate::view::draw(f, &mut t.app)).unwrap();
+    }
+    fn mouse(t: &mut T, kind: MouseEventKind, (column, row): (u16, u16)) {
+        let m = MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        t.ctl.handle(&mut t.app, AppEvent::Input(Event::Mouse(m)));
+    }
+    fn down(t: &mut T, at: (u16, u16)) {
+        mouse(t, MouseEventKind::Down(MouseButton::Left), at);
+    }
+    /// Press on `from`, drag, release on `to`.
+    fn drag(t: &mut T, from: (u16, u16), to: (u16, u16)) {
+        down(t, from);
+        mouse(t, MouseEventKind::Drag(MouseButton::Left), to);
+        mouse(t, MouseEventKind::Up(MouseButton::Left), to);
+    }
+    /// Screen cell of `name`'s row in `side`.
+    fn at(t: &T, side: Side, name: &str) -> (u16, u16) {
+        let p = &t.app.panes[side.idx()];
+        let i = names(p).iter().position(|n| *n == name).unwrap();
+        let r = t.app.hit.panes[side.idx()];
+        (r.x + 1, r.y + (i - p.offset) as u16)
+    }
+    fn exists(p: String) -> bool {
+        std::path::Path::new(&p).exists()
+    }
+
+    #[test]
+    fn click_focuses_and_moves_cursor() {
+        let mut t = setup(&[], &["a.txt", "b.txt"]);
+        draw(&mut t);
+        let b = at(&t, Right, "b.txt");
+        down(&mut t, b);
+        assert_eq!(t.app.focus, Right);
+        assert_eq!(t.app.panes[1].current().unwrap().name, "b.txt");
+    }
+
+    #[test]
+    fn double_click_enters_dir() {
+        let mut t = setup(&["a.txt", "sub/", "sub/x"], &[]);
+        draw(&mut t);
+        let sub = at(&t, Left, "sub");
+        down(&mut t, sub);
+        assert!(
+            t.app.panes[0].loading.is_none(),
+            "single click only selects"
+        );
+        down(&mut t, sub);
+        pump(&mut t, |a| a.panes[0].cwd.ends_with("/sub"));
+        assert_eq!(names(&t.app.panes[0]), ["..", "x"]);
+    }
+
+    #[test]
+    fn toolbar_click_opens_new_dir_popup() {
+        let mut t = setup(&[], &[]);
+        draw(&mut t);
+        let r = t.app.hit.toolbar[0];
+        down(&mut t, (r.x, r.y));
+        assert_eq!(input(&t.app), ("New Dir", ""));
+    }
+
+    #[test]
+    fn wheel_moves_cursor_without_focus_change() {
+        let mut t = setup(&[], &["a", "b", "c", "d", "e"]);
+        draw(&mut t);
+        let over = at(&t, Right, "..");
+        mouse(&mut t, MouseEventKind::ScrollDown, over);
+        assert_eq!(t.app.focus, Left);
+        assert_eq!(t.app.panes[1].cursor, 3);
+        mouse(&mut t, MouseEventKind::ScrollUp, over);
+        assert_eq!(t.app.panes[1].cursor, 0);
+    }
+
+    #[test]
+    fn drag_to_other_pane_copies_into_cwd() {
+        let mut t = setup(&["a.txt", "b.txt"], &[]);
+        draw(&mut t);
+        // Dropped on the other pane's ".." row: that is still "into its cwd".
+        let (from, to) = (at(&t, Left, "b.txt"), at(&t, Right, ".."));
+        drag(&mut t, from, to);
+        assert!(t.app.drag.is_none());
+        pump(&mut t, |a| lists(a, Right, &["b.txt"]));
+        assert_eq!(t.app.status, "Copied 1 item(s)");
+        assert_eq!(names(&t.app.panes[1]), ["..", "b.txt"]);
+    }
+
+    #[test]
+    fn drag_onto_dir_row_copies_into_that_dir() {
+        let mut t = setup(&["a.txt"], &["d/"]);
+        draw(&mut t);
+        let (from, to) = (at(&t, Left, "a.txt"), at(&t, Right, "d"));
+        drag(&mut t, from, to);
+        pump(&mut t, |a| a.status == "Copied 1 item(s)");
+        assert!(exists(join(&t.dirs[1], "d/a.txt")));
+        assert!(!exists(join(&t.dirs[1], "a.txt")));
+    }
+
+    #[test]
+    fn drag_marked_row_copies_whole_selection() {
+        let mut t = setup(&["a.txt", "b.txt", "c.txt"], &[]);
+        draw(&mut t);
+        let p = &mut t.app.panes[0];
+        p.marked.extend(["a.txt".to_string(), "c.txt".to_string()]);
+        let (from, to) = (at(&t, Left, "c.txt"), at(&t, Right, ".."));
+        drag(&mut t, from, to);
+        pump(&mut t, |a| lists(a, Right, &["a.txt", "c.txt"]));
+        assert_eq!(names(&t.app.panes[1]), ["..", "a.txt", "c.txt"]);
+    }
+
+    #[test]
+    fn drag_items_fixed_at_press() {
+        let mut t = setup(&["b.txt"], &[]);
+        draw(&mut t);
+        let (from, to) = (at(&t, Left, "b.txt"), at(&t, Right, ".."));
+        down(&mut t, from);
+        // A refresh lands mid-drag: a0.txt now sits where b.txt was pressed.
+        std::fs::write(join(&t.dirs[0], "a0.txt"), "a0").unwrap();
+        let cwd = t.dirs[0].clone();
+        let listing = vec![file("a0.txt"), file("b.txt")];
+        t.app.panes[0].set_listing(cwd, listing, None);
+        mouse(&mut t, MouseEventKind::Drag(MouseButton::Left), to);
+        mouse(&mut t, MouseEventKind::Up(MouseButton::Left), to);
+        pump(&mut t, |a| lists(a, Right, &["b.txt"]));
+        assert_eq!(names(&t.app.panes[1]), ["..", "b.txt"]);
+    }
+
+    #[test]
+    fn drop_on_same_pane_does_nothing() {
+        let mut t = setup(&["a.txt", "d/"], &[]);
+        draw(&mut t);
+        let (from, to) = (at(&t, Left, "a.txt"), at(&t, Left, "d"));
+        drag(&mut t, from, to);
+        assert!(t.app.drag.is_none());
+        assert!(t.app.transfers.jobs.is_empty());
+        // A plain click-release over the other pane is no drop either.
+        let other = at(&t, Right, "..");
+        down(&mut t, from);
+        mouse(&mut t, MouseEventKind::Up(MouseButton::Left), other);
+        assert!(t.app.transfers.jobs.is_empty());
+    }
+
+    #[test]
+    fn mouse_ignored_while_popup_open() {
+        let mut t = setup(&[], &["a.txt"]);
+        draw(&mut t);
+        let a = at(&t, Right, "a.txt");
+        press(&mut t, KeyCode::Char('n'));
+        down(&mut t, a);
+        mouse(&mut t, MouseEventKind::ScrollDown, a);
+        assert_eq!(t.app.focus, Left);
+        assert_eq!(t.app.panes[1].cursor, 0);
+        assert!(t.app.drag.is_none());
+        assert_eq!(input(&t.app), ("New Dir", ""));
+        press(&mut t, KeyCode::Esc);
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        let path = String::new();
+        t.app.conflicts.push_back(ConflictPrompt {
+            job: 1,
+            path,
+            reply,
+        });
+        down(&mut t, a);
+        assert_eq!(t.app.focus, Left);
+        assert!(t.app.drag.is_none());
     }
 
     #[test]
