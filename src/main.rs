@@ -1,6 +1,7 @@
 #![allow(dead_code)] // ponytail: until Task 10 wires main
 mod fs;
 mod icons;
+mod model;
 mod transfer;
 use clap::Parser;
 
