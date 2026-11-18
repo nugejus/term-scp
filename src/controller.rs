@@ -370,6 +370,9 @@ impl Controller {
         let side = app.focus;
         let page = app.hit.panes[side.idx()].height as isize;
         let p = &mut app.panes[side.idx()];
+        if matches!(cmd, CursorUp | CursorDown | PageUp | PageDown | Home | End) {
+            p.clear_marks(); // moving without Shift ends the selection
+        }
         match cmd {
             CursorUp => p.move_cursor(-1, false),
             CursorDown => p.move_cursor(1, false),
@@ -735,6 +738,20 @@ mod tests {
         let root = t.dirs[0].clone();
         pump(&mut t, |a| a.panes[0].cwd == root);
         assert_eq!(t.app.panes[0].current().unwrap().name, "sub");
+    }
+
+    #[test]
+    fn plain_move_after_shift_clears_marks() {
+        let mut t = setup(&["a", "b", "c"], &[]);
+        press(&mut t, KeyCode::Down);
+        press_mod(&mut t, KeyCode::Down, KeyModifiers::SHIFT);
+        assert_eq!(t.app.panes[0].marked.len(), 2);
+        press(&mut t, KeyCode::Down);
+        assert!(t.app.panes[0].marked.is_empty());
+        assert_eq!(t.app.panes[0].current().unwrap().name, "c");
+        press_mod(&mut t, KeyCode::Up, KeyModifiers::SHIFT);
+        press(&mut t, KeyCode::End);
+        assert!(t.app.panes[0].marked.is_empty());
     }
 
     #[test]

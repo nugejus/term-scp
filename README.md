@@ -47,7 +47,7 @@ term-scp HOST:DIR [-P PORT] [-i KEY] [-o OPT]...  # passed to ssh as -p / -i / -
 | `q` / `Ctrl` `C`            | Quit; asks first while transfers run     |
 
 The selection is the marked files, or the file under the cursor when nothing is marked. `..` is never part of it.
-- Plain `↑` / `↓` keep the marks, and so do a copy and `Ctrl` `R`. Opening another folder clears them.
+- Moving the cursor without `Shift` (`↑` / `↓`, `PgUp` / `PgDn`, `Home` / `End`) clears the marks, and so does opening another folder. A copy and `Ctrl` `R` keep them.
 - The bottom line shows how many files are marked in the focused pane and their size (folders not counted), and the last message or error. The next key clears the message.
 
 The toolbar buttons do what their keys do. Everything is also clickable; double-click opens a folder, and the wheel moves the cursor in the pane under the pointer without focusing it. Drag a file onto the other pane to copy it into that pane's folder, or onto a folder row other than `..` to copy into that folder. Its dimmed name follows the pointer. Dragging a marked file takes all marked files.
