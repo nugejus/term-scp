@@ -45,8 +45,10 @@ pub fn key_to_command(k: KeyEvent) -> Option<Command> {
         KeyCode::PageDown => PageDown,
         KeyCode::Home => Home,
         KeyCode::End => End,
-        KeyCode::Left => Parent,
-        KeyCode::Right | KeyCode::Enter => Enter,
+        KeyCode::Backspace => Parent,
+        KeyCode::Enter => Enter,
+        KeyCode::Left => Focus(Side::Left),
+        KeyCode::Right => Focus(Side::Right),
         KeyCode::Tab | KeyCode::BackTab => SwitchPane,
         KeyCode::Esc => ClearMarks,
         KeyCode::Char('r') if ctrl => Refresh,
@@ -277,21 +279,23 @@ impl Controller {
                     from: s,
                     items,
                     src_cwd,
-                    active: false,
+                    at: None,
                 });
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(d) = &mut app.drag {
-                    d.active = true;
+                    d.at = Some(pos);
                 }
             }
+            // Anywhere on the other box drops, border and title included. No motion is required:
+            // a release over the other pane was a drag even if the terminal reported no movement.
             MouseEventKind::Up(MouseButton::Left) => {
                 if let Some(d) = released
-                    && d.active
                     && !d.items.is_empty()
-                    && let Some((s, row)) = under(app, pos)
-                    && s == d.from.other()
+                    && app.hit.boxes[d.from.other().idx()].contains(pos)
                 {
+                    let s = d.from.other();
+                    let row = under(app, pos).and_then(|(_, row)| row);
                     let dst = &app.panes[s.idx()];
                     let target = match row.map(|i| &dst.entries[i]) {
                         Some(e) if e.is_dir && e.name != ".." => join(&dst.cwd, &e.name),
@@ -375,6 +379,7 @@ impl Controller {
             PageDown => p.move_cursor(page, false),
             Home => p.cursor_to(0),
             End => p.cursor_to(usize::MAX),
+            Focus(s) => app.focus = s,
             SwitchPane => app.focus = side.other(),
             ClearMarks => p.clear_marks(),
             Enter => match p.current() {
@@ -685,9 +690,10 @@ mod tests {
             (K::PageDown, none, PageDown),
             (K::Home, none, Home),
             (K::End, none, End),
-            (K::Left, none, Parent),
-            (K::Right, none, Enter),
+            (K::Backspace, none, Parent),
             (K::Enter, none, Enter),
+            (K::Left, none, Focus(Left)),
+            (K::Right, none, Focus(Right)),
             (K::Tab, none, SwitchPane),
             (K::BackTab, shift, SwitchPane),
             (K::Esc, none, ClearMarks),
@@ -725,10 +731,21 @@ mod tests {
         pump(&mut t, |a| a.panes[0].cwd.ends_with("/sub"));
         assert_eq!(names(&t.app.panes[0]), ["..", "x"]);
         assert_eq!(t.app.panes[0].cursor, 0);
-        press(&mut t, KeyCode::Left);
+        press(&mut t, KeyCode::Backspace);
         let root = t.dirs[0].clone();
         pump(&mut t, |a| a.panes[0].cwd == root);
         assert_eq!(t.app.panes[0].current().unwrap().name, "sub");
+    }
+
+    #[test]
+    fn arrows_pick_the_pane() {
+        let mut t = setup(&[], &[]);
+        press(&mut t, KeyCode::Right);
+        assert_eq!(t.app.focus, Right);
+        press(&mut t, KeyCode::Right);
+        assert_eq!(t.app.focus, Right);
+        press(&mut t, KeyCode::Left);
+        assert_eq!(t.app.focus, Left);
     }
 
     #[test]
@@ -1220,11 +1237,30 @@ mod tests {
         drag(&mut t, from, to);
         assert!(t.app.drag.is_none());
         assert!(t.app.transfers.jobs.is_empty());
-        // A plain click-release over the other pane is no drop either.
-        let other = at(&t, Right, "..");
+    }
+
+    #[test]
+    fn drop_on_title_without_motion_events_copies() {
+        let mut t = setup(&["a.txt"], &[]);
+        draw(&mut t);
+        let from = at(&t, Left, "a.txt");
+        let title = t.app.hit.boxes[1];
+        // Some terminals report no motion: a press here and a release there is still a drag.
         down(&mut t, from);
-        mouse(&mut t, MouseEventKind::Up(MouseButton::Left), other);
-        assert!(t.app.transfers.jobs.is_empty());
+        assert!(t.app.drag.as_ref().unwrap().at.is_none());
+        mouse(&mut t, MouseEventKind::Up(MouseButton::Left), (title.x + 3, title.y));
+        pump(&mut t, |a| lists(a, Right, &["a.txt"]));
+        assert_eq!(t.app.status, "Copied 1 item(s)");
+    }
+
+    #[test]
+    fn drag_tracks_pointer() {
+        let mut t = setup(&["a.txt"], &[]);
+        draw(&mut t);
+        let a = at(&t, Left, "a.txt");
+        down(&mut t, a);
+        mouse(&mut t, MouseEventKind::Drag(MouseButton::Left), (50, 4));
+        assert_eq!(t.app.drag.as_ref().unwrap().at, Some(Position::new(50, 4)));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::fs::{Entry, Fs, sort_entries};
 use crate::transfer::{JobId, Resolution};
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Instant;
 
@@ -33,6 +33,7 @@ pub enum Command {
     End,
     Parent,
     Enter,
+    Focus(Side),
     SwitchPane,
     ClearMarks,
     QuickCopy,
@@ -264,13 +265,14 @@ impl Transfers {
 #[derive(Default)]
 pub struct Hit {
     pub panes: [Rect; 2],   // inner row areas
+    pub boxes: [Rect; 2],   // whole pane boxes, border and title included: the drop zones
     pub toolbar: Vec<Rect>, // toolbar[i] <-> TOOLBAR[i]
 }
 pub struct Drag {
     pub from: Side,
     pub items: Vec<Entry>, // fixed at press time
     pub src_cwd: String,   // likewise: a listing landing mid-drag can't move the sources
-    pub active: bool,
+    pub at: Option<Position>, // the pointer, once it has moved: where the ghost is drawn
 }
 pub struct App {
     pub panes: [Pane; 2],

@@ -31,8 +31,9 @@ term-scp HOST:DIR [-P PORT] [-i KEY] [-o OPT]...  # passed to ssh as -p / -i / -
 | `Shift` `↑` / `↓`           | Select a range; going back shrinks it    |
 | `PgUp` / `PgDn`             | Page up / down                           |
 | `Home` / `End`              | First / last file                        |
-| `←`                         | Parent folder                            |
-| `→` / `Enter`               | Open the folder                          |
+| `Backspace`                 | Parent folder                            |
+| `Enter`                     | Open the folder                          |
+| `←` / `→`                   | Left / right pane                        |
 | `Tab`                       | Switch pane                              |
 | `Esc`                       | Clear the marks                          |
 | `c`                         | Copy the selection into the other pane's folder |
@@ -49,11 +50,11 @@ The selection is the marked files, or the file under the cursor when nothing is 
 - Plain `↑` / `↓` keep the marks, and so do a copy and `Ctrl` `R`. Opening another folder clears them.
 - The bottom line shows how many files are marked in the focused pane and their size (folders not counted), and the last message or error. The next key clears the message.
 
-The toolbar buttons do what their keys do. Everything is also clickable; double-click opens a folder, and the wheel moves the cursor in the pane under the pointer without focusing it. Drag a file onto the other pane to copy it into that pane's folder, or onto a folder row other than `..` to copy into that folder. Dragging a marked file takes all marked files.
+The toolbar buttons do what their keys do. Everything is also clickable; double-click opens a folder, and the wheel moves the cursor in the pane under the pointer without focusing it. Drag a file onto the other pane to copy it into that pane's folder, or onto a folder row other than `..` to copy into that folder. Its dimmed name follows the pointer. Dragging a marked file takes all marked files.
 
 ## Copy to and Move
 
-`Shift` `C` and `m` open a line with the destination filled in: `<other pane's folder>/<name>` for one file, the other pane's folder for several.
+`Shift` `C` and `m` open a line with the destination filled in: `<other pane's folder>/<name>` for one file, the other pane's folder for several. The box is a third of the screen wide; a long path wraps.
 - Edit the last part to copy under a new name.
 - Edit the rest to copy somewhere else on the other side. `~` is the other side's home.
 - A path that ends in `/`, or is an existing folder with another name, puts the files inside it. That folder must already exist; term-scp doesn't create it.

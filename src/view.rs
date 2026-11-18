@@ -11,12 +11,13 @@ use ratatui::widgets::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// The Key table from Global Constraints: (key, help text).
-const HELP: [(&str, &str); 17] = [
+const HELP: [(&str, &str); 18] = [
     ("↑ / ↓", "Move cursor"),
     ("Shift+↑ / Shift+↓", "Select range"),
     ("PgUp / PgDn / Home / End", "Page / first / last"),
-    ("←", "Parent dir"),
-    ("→ / Enter", "Open dir"),
+    ("Backspace", "Parent dir"),
+    ("Enter", "Open dir"),
+    ("← / →", "Left / right pane"),
     ("Tab / BackTab", "Switch pane"),
     ("Esc", "Clear selection"),
     ("c", "Copy to other pane"),
@@ -61,12 +62,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 
     let halves: [Rect; 2] = Layout::horizontal([Constraint::Fill(1); 2]).areas(mid);
+    app.hit.boxes = halves;
     for side in [Side::Left, Side::Right] {
         app.hit.panes[side.idx()] = draw_pane(f, app, side, halves[side.idx()]);
     }
 
     let right = match &app.drag {
-        Some(d) if d.active => format!("Drop to copy {} item(s)", d.items.len()),
+        Some(d) if d.at.is_some() && !d.items.is_empty() => {
+            format!("Drop to copy {} item(s)", d.items.len())
+        }
         _ => app.status.clone(),
     };
     let p = &app.panes[app.focus.idx()];
@@ -92,6 +96,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         ..bottom
     };
     f.render_widget(Line::from(right).right_aligned(), r);
+    draw_ghost(f, app);
 
     let full = f.area().width as usize;
     match &app.popup {
@@ -101,27 +106,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             value,
             cursor,
         }) => {
-            let b = value
-                .char_indices()
-                .nth(*cursor)
-                .map_or(value.len(), |(i, _)| i);
-            let (before, rest) = value.split_at(b);
-            let mut chars = rest.chars();
-            let at = chars.next().map_or(" ".into(), String::from);
-            let avail = full.min(64).saturating_sub(4 + at.width());
-            let value = Line::from(vec![
-                Span::raw(fit_left(before, avail)),
-                Span::styled(at, Modifier::REVERSED),
-                Span::raw(chars.as_str()),
-            ]);
-            let hint = match kind {
-                InputKind::CopyTo { .. } => {
-                    "Enter confirm · Esc cancel · existing dir = put inside"
-                }
-                _ => "Enter confirm · Esc cancel",
-            };
-            let hint = Line::styled(hint, Color::DarkGray);
-            popup(f, title, vec![value, hint], 60);
+            // A third of the screen whatever the cursor does; long text wraps, read from its start.
+            let inner = (full / 3).saturating_sub(4);
+            let mut lines = wrap_input(value, *cursor, inner);
+            let mut hints = vec!["Enter confirm", "Esc cancel"];
+            if matches!(kind, InputKind::CopyTo { .. }) {
+                hints.push("existing dir → inside");
+            }
+            let hints = pack(&hints, inner).into_iter();
+            lines.extend(hints.map(|h| Line::styled(h, Color::DarkGray)));
+            popup(f, title, lines, inner);
         }
         Some(Popup::Help) => {
             let lines = HELP
@@ -251,11 +245,80 @@ fn popup(f: &mut Frame, title: &str, lines: Vec<Line>, min_w: usize) {
         .unwrap_or(u16::MAX)
         .min(full.height);
     let r = full.centered(Constraint::Length(w), Constraint::Length(h));
+    // Greyed-out backdrop and an accent frame: the popup must not blend into the panes.
+    let backdrop = Style::new()
+        .fg(Color::DarkGray)
+        .bg(Color::Reset)
+        .remove_modifier(Modifier::all());
+    f.buffer_mut().set_style(full, backdrop);
+    let accent = Style::new()
+        .fg(Color::LightCyan)
+        .add_modifier(Modifier::BOLD);
     let block = Block::bordered()
-        .title(format!(" {title} "))
+        .border_type(BorderType::Thick)
+        .border_style(accent)
+        .title(Span::styled(format!(" {title} "), accent))
         .padding(Padding::horizontal(1));
     f.render_widget(Clear, r);
     f.render_widget(Paragraph::new(lines).block(block), r);
+}
+
+/// The dragged items' name at the pointer, dimmed over whatever is beneath (its background
+/// shows through): the closest a terminal gets to a translucent drag image.
+fn draw_ghost(f: &mut Frame, app: &App) {
+    let Some(d) = &app.drag else { return };
+    let (Some(at), Some(e)) = (d.at, d.items.first()) else {
+        return;
+    };
+    let mut text = match app.icons {
+        true => format!("{} {}", icon(&e.name, e.is_dir).0, e.name),
+        false => e.name.clone(),
+    };
+    if d.items.len() > 1 {
+        text += &format!(" +{}", d.items.len() - 1);
+    }
+    let area = f.area();
+    let x = at.x.saturating_add(1); // beside the pointer, not under it
+    if x < area.right() && at.y < area.bottom() {
+        let style = Style::new()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::DIM | Modifier::ITALIC);
+        let ghost = Span::styled(text, style);
+        f.buffer_mut().set_span(x, at.y, &ghost, area.right() - x);
+    }
+}
+
+/// `value` hard-wrapped to `width` columns from its start, the cell at char `cursor` reversed.
+/// One trailing cell, so a cursor at the end shows.
+fn wrap_input(value: &str, cursor: usize, width: usize) -> Vec<Line<'static>> {
+    let (mut lines, mut line, mut w) = (vec![], vec![], 0);
+    for (i, c) in value.chars().chain([' ']).enumerate() {
+        let cw = c.width().unwrap_or(0);
+        if w + cw > width && w > 0 {
+            lines.push(Line::from(std::mem::take(&mut line)));
+            w = 0;
+        }
+        let style = match i == cursor {
+            true => Style::new().add_modifier(Modifier::REVERSED),
+            false => Style::new(),
+        };
+        line.push(Span::styled(c.to_string(), style));
+        w += cw;
+    }
+    lines.push(Line::from(line));
+    lines
+}
+
+/// `parts` joined with " · ", a new line wherever the next one would pass `width`.
+fn pack(parts: &[&str], width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = vec![];
+    for p in parts {
+        match lines.last_mut() {
+            Some(l) if l.width() + 3 + p.width() <= width => *l += &format!(" · {p}"),
+            _ => lines.push(p.to_string()),
+        }
+    }
+    lines
 }
 
 pub fn human_size(n: u64) -> String {
@@ -516,6 +579,65 @@ mod tests {
         assert_eq!(b[(r.x - 1, r.y - 1)].fg, Color::DarkGray);
     }
 
+    /// The popup's top-left corner and width, found by its title.
+    fn popup_top(b: &Buffer, title: &str) -> ((u16, u16), usize) {
+        let head = format!("┏ {title} ");
+        let y = (0..b.area.height).find(|&y| row(b, y).contains(&head)).unwrap();
+        let r: Vec<char> = row(b, y).chars().collect();
+        let l = r.iter().rposition(|&c| c == '┏').unwrap();
+        let rr = r.iter().rposition(|&c| c == '┓').unwrap();
+        ((l as u16, y), rr - l + 1)
+    }
+
+    #[test]
+    fn input_popup_is_a_third_wide_and_reads_from_the_start() {
+        let mut a = app("/d", vec![]);
+        let value = format!("{LONG}/report.txt");
+        let n = value.chars().count();
+        let mut b = Buffer::empty(Rect::default());
+        for cursor in [n, 0, n / 2] {
+            a.popup = Some(Popup::Input {
+                kind: InputKind::NewDir { dir: "/".into() },
+                title: "Copy to".into(),
+                value: value.clone(),
+                cursor,
+            });
+            b = render(&mut a, 90, 24);
+            assert_eq!(popup_top(&b, "Copy to").1, 30, "cursor {cursor}");
+        }
+        let text: String = (0..24).map(|y| row(&b, y)).collect();
+        assert!(text.contains("┃ /a/very/long"), "{text}");
+        assert!(text.contains("report.txt"), "{text}");
+        assert!(!text.contains('…'), "{text}");
+    }
+
+    #[test]
+    fn popup_greys_out_the_panes() {
+        let mut a = app("/d", vec![file("a", 1)]);
+        a.popup = Some(Popup::Help);
+        let b = render(&mut a, 80, 24);
+        assert_eq!(b[(0, 1)].fg, Color::DarkGray, "focused border dimmed");
+        let (corner, _) = popup_top(&b, "Help");
+        assert_eq!(b[corner].fg, Color::LightCyan);
+    }
+
+    #[test]
+    fn ghost_follows_pointer() {
+        let mut a = app("/d", vec![]);
+        a.icons = false;
+        a.drag = Some(Drag {
+            from: Side::Left,
+            items: vec![file("x.txt", 5), file("y.txt", 5)],
+            src_cwd: "/d".into(),
+            at: Some(ratatui::layout::Position::new(50, 5)),
+        });
+        let b = render(&mut a, 80, 12);
+        let at: String = row(&b, 5).chars().skip(51).collect();
+        assert!(at.starts_with("x.txt +1"), "{}", row(&b, 5));
+        assert!(b[(51, 5)].modifier.contains(Modifier::DIM));
+        assert!(row(&b, 11).contains("Drop to copy 2 item(s)"));
+    }
+
     #[test]
     fn hit_cache_filled() {
         let mut a = app("/d", vec![]);
@@ -581,7 +703,7 @@ mod tests {
                             from: Side::Left,
                             items,
                             src_cwd: "/d".into(),
-                            active: true,
+                            at: Some(ratatui::layout::Position::new(w - 1, h - 1)),
                         });
                     }
                 }
