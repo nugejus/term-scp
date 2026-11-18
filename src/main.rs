@@ -1,4 +1,5 @@
 #![allow(dead_code)] // ponytail: until Task 10 wires main
+mod icons;
 use clap::Parser;
 
 #[derive(Parser)]
