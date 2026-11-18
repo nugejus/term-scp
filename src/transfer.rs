@@ -190,6 +190,12 @@ async fn scan(
     let d = parent(d).map_or(d.clone(), |(dir, n)| {
         join(&dir, &dst_name_for(src, dst, &n))
     });
+    // cp/mv: an existing dir of another name receives the item inside it; a same-name one merges.
+    let name = parent(s).map_or(s.clone(), |(_, n)| dst_name_for(src, dst, &n));
+    let d = match dst.stat(&d).await {
+        Ok(Some(e)) if e.is_dir && parent(&d).is_none_or(|(_, n)| n != name) => join(&d, &name),
+        _ => d,
+    };
     let e = match src.stat(s).await {
         Ok(Some(e)) => e,
         Ok(None) => return bad.push((s.clone(), d, "not found".into())),
@@ -838,6 +844,54 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn copy_dir_onto_existing_other_dir_goes_inside() {
+        guarded(async {
+            let (_a, s) = tmp();
+            let (_b, d) = tmp();
+            let (photos, archive) = (join(&s, "photos"), join(&d, "archive"));
+            std::fs::create_dir_all(join(&photos, "2024")).unwrap();
+            std::fs::write(join(&photos, "2024/p.jpg"), "p").unwrap();
+            std::fs::create_dir(&archive).unwrap();
+            std::fs::write(join(&archive, "own.txt"), "own").unwrap();
+            let items = [(photos.clone(), archive.clone())];
+            let log = run(Fs::Local, test_remote().await, &items, true, Skip).await;
+            assert!(ev(&log, "Finished").contains("copied: 1,"), "{log:?}");
+            assert_eq!(
+                tree(&archive).keys().collect::<Vec<_>>(),
+                ["own.txt", "photos/2024/p.jpg"]
+            );
+            assert_eq!(
+                std::fs::read_to_string(join(&archive, "own.txt")).unwrap(),
+                "own"
+            );
+            assert!(!exists(&photos));
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn copy_file_onto_existing_dir_goes_inside() {
+        guarded(async {
+            let (_a, s) = tmp();
+            let (_b, d) = tmp();
+            let (f, dir) = (join(&s, "f.txt"), join(&d, "dir"));
+            std::fs::write(&f, "f").unwrap();
+            std::fs::create_dir(&dir).unwrap();
+            let log = run(
+                Fs::Local,
+                test_remote().await,
+                &[(f, dir.clone())],
+                false,
+                Skip,
+            )
+            .await;
+            assert!(ev(&log, "Finished").contains("copied: 1,"), "{log:?}");
+            assert_eq!(std::fs::read_to_string(join(&dir, "f.txt")).unwrap(), "f");
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn nfc_on_upload() {
         guarded(async {
             let (_a, s) = tmp();
@@ -899,7 +953,14 @@ mod tests {
             std::fs::create_dir(&sd).unwrap();
             std::fs::write(join(&sd, "a.txt"), "a").unwrap();
             std::os::unix::fs::symlink(".", join(&sd, "loop")).unwrap();
-            let log = run(Fs::Local, test_remote().await, &[(sd, dd.clone())], false, Skip).await;
+            let log = run(
+                Fs::Local,
+                test_remote().await,
+                &[(sd, dd.clone())],
+                false,
+                Skip,
+            )
+            .await;
             assert!(ev(&log, "ItemError").contains("symlink loop"), "{log:?}");
             assert!(ev(&log, "Finished").contains("copied: 1,"), "{log:?}");
             assert_eq!(tree(&dd).keys().collect::<Vec<_>>(), ["a.txt"]);
@@ -917,7 +978,14 @@ mod tests {
             std::fs::write(join(&sd, "a.txt"), "a").unwrap();
             std::os::unix::fs::symlink(".", join(&sd, "l1")).unwrap();
             std::os::unix::fs::symlink("..", join(&sd, "l2")).unwrap();
-            let log = run(Fs::Local, test_remote().await, &[(sd, dd.clone())], false, Skip).await;
+            let log = run(
+                Fs::Local,
+                test_remote().await,
+                &[(sd, dd.clone())],
+                false,
+                Skip,
+            )
+            .await;
             assert_eq!(count(&log, "ItemError"), 2, "{log:?}");
             assert!(ev(&log, "Finished").contains("copied: 1,"), "{log:?}");
             assert_eq!(tree(&dd).keys().collect::<Vec<_>>(), ["a.txt"]);

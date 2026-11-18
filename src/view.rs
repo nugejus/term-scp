@@ -1,5 +1,5 @@
 use crate::icons::icon;
-use crate::model::{App, Popup, Side, TOOLBAR, Transfers};
+use crate::model::{App, InputKind, Popup, Side, TOOLBAR, Transfers};
 use chrono::{Datelike, Local, TimeZone};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -95,10 +95,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let full = f.area().width as usize;
     match &app.popup {
         Some(Popup::Input {
+            kind,
             title,
             value,
             cursor,
-            ..
         }) => {
             let b = value
                 .char_indices()
@@ -113,7 +113,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 Span::styled(at, Modifier::REVERSED),
                 Span::raw(chars.as_str()),
             ]);
-            let hint = Line::styled("Enter confirm · Esc cancel", Color::DarkGray);
+            let hint = match kind {
+                InputKind::CopyTo { .. } => {
+                    "Enter confirm · Esc cancel · existing dir = put inside"
+                }
+                _ => "Enter confirm · Esc cancel",
+            };
+            let hint = Line::styled(hint, Color::DarkGray);
             popup(f, title, vec![value, hint], 60);
         }
         Some(Popup::Help) => {

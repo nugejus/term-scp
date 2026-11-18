@@ -63,7 +63,8 @@ pub fn key_to_command(k: KeyEvent) -> Option<Command> {
     })
 }
 
-/// One item and no trailing `/`: `value` is the exact destination. Otherwise items go into it.
+/// One item and no trailing `/`: `value` is the exact destination (the engine puts the item
+/// inside it if it is an existing dir of another name). Otherwise items go into it.
 pub fn copy_targets(
     items: &[Entry],
     src_cwd: &str,
