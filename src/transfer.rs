@@ -1,5 +1,6 @@
 use crate::fs::{Entry, Fs, join, normalize, parent};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Semaphore, oneshot};
@@ -70,6 +71,27 @@ pub fn dst_name_for(src: &Fs, dst: &Fs, name: &str) -> String {
         name.nfc().collect()
     } else {
         name.to_string()
+    }
+}
+
+/// Destinations being written right now, as (dst is local, path): one writer per `<dest>.term-scp-part`.
+static CLAIMS: LazyLock<Mutex<HashSet<(bool, String)>>> = LazyLock::new(Default::default);
+
+/// Holds a destination in `CLAIMS` until dropped, on every exit path.
+struct Claim((bool, String));
+
+impl Claim {
+    fn take(dst: &Fs, path: &str) -> Option<Claim> {
+        let key = (dst.is_local(), path.to_string());
+        // Separate statement: the guard must be gone before a Claim could ever drop.
+        let fresh = CLAIMS.lock().unwrap().insert(key.clone());
+        fresh.then(|| Claim(key))
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        CLAIMS.lock().unwrap().remove(&self.0);
     }
 }
 
@@ -319,6 +341,10 @@ pub async fn run_job(job: Job, emit: Emit) {
                     if broken.as_deref().is_some_and(|b| under(&d, b)) {
                         return Ok(Resolution::Skip);
                     }
+                    // Before the conflict check: a running writer has no dest yet, only its part.
+                    let Some(_claim) = Claim::take(&dst, &d) else {
+                        return Err("being written by another transfer".to_string());
+                    };
                     match dst.stat(&d).await? {
                         Some(e) if e.is_dir => return Err("destination is a directory".to_string()),
                         Some(_) if !all => {
@@ -733,6 +759,41 @@ mod tests {
             assert!(res.is_err());
             assert_eq!(names(&d), ["f"]);
             assert_eq!(names(&dest), ["keep"]);
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn same_destination_in_two_jobs_never_corrupts() {
+        guarded(async {
+            let (_a, s) = tmp();
+            let (_b, d) = tmp();
+            let dst = test_remote().await;
+            let (dest, src2) = (join(&d, "report.bin"), join(&s, "report.bin"));
+            let (one, two) = (bytes(MIB, 1), bytes(MIB, 2));
+            std::fs::write(&src2, &two).unwrap();
+            // The first transfer holds the claim, stalled mid-copy until `tx` is fed again.
+            let claim = Claim::take(&dst, &dest).unwrap();
+            let (mut tx, mut rx) = tokio::io::duplex(64 * 1024);
+            let first = tokio::spawn({
+                let (dst, dest) = (dst.clone(), dest.clone());
+                async move {
+                    let _claim = claim;
+                    write_via_part(&dst, &dest, &mut rx, 0o644, &mut |_| {}).await
+                }
+            });
+            tx.write_all(&one[..MIB / 2]).await.unwrap();
+            let items = [(src2.clone(), dest.clone())];
+            let log = run(Fs::Local, dst.clone(), &items, true, Overwrite).await;
+            let busy = "being written by another transfer";
+            assert!(ev(&log, "ItemError").contains(busy), "{log:?}");
+            assert!(ev(&log, "Finished").contains("copied: 0,"), "{log:?}");
+            assert!(std::fs::read(&src2).unwrap() == two, "Move lost its source");
+            tx.write_all(&one[MIB / 2..]).await.unwrap();
+            drop(tx);
+            first.await.unwrap().unwrap();
+            assert!(std::fs::read(&dest).unwrap() == one, "dest corrupted");
+            assert!(Claim::take(&dst, &dest).is_some(), "claim not released");
         })
         .await
     }
