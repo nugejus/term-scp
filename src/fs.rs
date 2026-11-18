@@ -126,7 +126,8 @@ pub fn ssh_argv(host: &str, opts: &SshOpts, control: &str, master: bool) -> Vec<
     for o in &opts.options {
         v.extend(["-o".into(), o.clone()]);
     }
-    v.extend(["-s".into(), host.into(), "sftp".into()]);
+    // `--`: a host starting with `-` must never parse as an option.
+    v.extend(["-s".into(), "--".into(), host.into(), "sftp".into()]);
     v
 }
 
@@ -718,7 +719,7 @@ mod tests {
         ]
         .into_iter()
         .chain(G)
-        .chain(["-p", "2222", "-i", "k", "-o", "A=b", "-s", "h", "sftp"])
+        .chain(["-p", "2222", "-i", "k", "-o", "A=b", "-s", "--", "h", "sftp"])
         .collect();
         assert_eq!(ssh_argv("h", &o, "/tmp/c", true), want);
         let none = SshOpts {
@@ -737,7 +738,7 @@ mod tests {
         ]
         .into_iter()
         .chain(G)
-        .chain(["-s", "h", "sftp"])
+        .chain(["-s", "--", "h", "sftp"])
         .collect();
         assert_eq!(ssh_argv("h", &none, "/tmp/c", false), want);
     }
