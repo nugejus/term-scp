@@ -1,10 +1,13 @@
 set stty_init "rows 24 columns 80"
 set timeout 10
-spawn env PATH=[pwd]/tests/fake-ssh:$env(PATH) ./target/debug/term-scp -l /tmp fake:/tmp
+spawn env TERM=xterm-256color PATH=[pwd]/tests/fake-ssh:$env(PATH) ./target/debug/term-scp -l /tmp fake:/tmp
 expect_after {
     timeout { puts "\nsmoke: timeout"; exit 1 }
     eof     { puts "\nsmoke: early eof"; exit 1 }
 }
+# What a terminal does: answer the image picker's Device Status Report.
+expect -ex "\033\[5n"
+send "\033\[0n"
 expect "local:"
 expect "fake:/"
 send "\t"

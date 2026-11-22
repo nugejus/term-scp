@@ -1,13 +1,16 @@
 use crate::icons::icon;
-use crate::model::{App, InputKind, MENU, Popup, Side, TOOLBAR, Transfers};
+use crate::model::{App, InputKind, MENU, Popup, Preview, Side, TOOLBAR, Transfers};
+use crate::preview::{Kind, fmt_secs};
 use chrono::{Datelike, Local, TimeZone};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Cell, Clear, Padding, Paragraph, Row, Table, TableState,
+    Block, BorderType, Cell, Clear, Padding, Paragraph, Row, Table, TableState, Wrap,
 };
+use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::{FilterType, Resize, StatefulImage};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// The Key table from Global Constraints: (key, help text).
@@ -17,7 +20,7 @@ const HELP: [(&str, &str); 22] = [
     ("15 ↓ / 15 ↑", "Move 15 rows (any number)"),
     ("PgUp / PgDn / Home / End", "Page / first / last"),
     ("Backspace", "Parent dir"),
-    ("Enter", "Open dir"),
+    ("Enter", "Open dir / preview file"),
     ("← / →", "Left / right pane"),
     ("Tab / BackTab", "Switch pane"),
     ("Esc", "Clear selection"),
@@ -39,6 +42,8 @@ const HELP: [(&str, &str); 22] = [
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.hit.toolbar.clear();
     app.hit.menu = Rect::default();
+    app.hit.close = Rect::default();
+    app.hit.preview = Rect::default();
     let [top, mid, bottom] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
@@ -111,7 +116,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_ghost(f, app);
 
     let full = f.area().width as usize;
-    match &app.popup {
+    match &mut app.popup {
         Some(Popup::Input {
             kind: InputKind::Filter,
             ..
@@ -156,7 +161,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             }
             popup(f, "Delete", lines, 0);
         }
-        &Some(Popup::Menu { at, cursor }) => app.hit.menu = draw_menu(f, at, cursor),
+        Some(Popup::Menu { at, cursor }) => app.hit.menu = draw_menu(f, *at, *cursor),
+        Some(Popup::Preview(p)) => (app.hit.close, app.hit.preview) = draw_preview(f, p),
         None => {
             if let Some(c) = app.conflicts.front() {
                 let head = format!("Job {}: file exists: ", c.job);
@@ -310,15 +316,138 @@ fn popup(f: &mut Frame, title: &str, lines: Vec<Line>, min_w: usize) {
         .unwrap_or(u16::MAX)
         .min(full.height);
     let r = full.centered(Constraint::Length(w), Constraint::Length(h));
-    // Greyed-out backdrop and an accent frame: the popup must not blend into the panes.
-    let backdrop = Style::new()
+    backdrop(f, r);
+    let block = frame().title(Span::styled(format!(" {title} "), ACCENT));
+    f.render_widget(Paragraph::new(lines).block(block), r);
+}
+
+/// Greys out the screen and clears `r`: a popup must not blend into the panes.
+fn backdrop(f: &mut Frame, r: Rect) {
+    let grey = Style::new()
         .fg(Color::DarkGray)
         .bg(Color::Reset)
         .remove_modifier(Modifier::all());
-    f.buffer_mut().set_style(full, backdrop);
-    let block = frame().title(Span::styled(format!(" {title} "), ACCENT));
+    let full = f.area();
+    f.buffer_mut().set_style(full, grey);
     f.render_widget(Clear, r);
-    f.render_widget(Paragraph::new(lines).block(block), r);
+}
+
+/// Returns the ✕ cells and the body.
+fn draw_preview(f: &mut Frame, p: &mut Preview) -> (Rect, Rect) {
+    let full = f.area();
+    let r = full.centered(Constraint::Percentage(80), Constraint::Percentage(80));
+    // At least 24×5 (border, two body rows, footer), clamped to the screen.
+    let r = r
+        .union(full.centered(Constraint::Length(24), Constraint::Length(5)))
+        .intersection(full);
+    backdrop(f, r);
+    // Cut from the left: the extension is the best clue, and the name never reaches the ✕.
+    let name = fit_left(&p.name, r.width.saturating_sub(8) as usize);
+    let block = frame()
+        .title(Span::styled(format!(" {name} "), ACCENT))
+        .title(Line::styled(" ✕ ", ACCENT).right_aligned());
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    // The right title's 3 cells, just left of ┓.
+    let close = Rect::new(r.right().saturating_sub(4), r.y, 3, 1).intersection(r);
+    let [body, foot] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
+    let size = human_size(p.size);
+    let footer = match &p.kind {
+        None => {
+            let mut s = "Loading…".to_string();
+            if let Some(done) = p.got {
+                s += &format!(" {} / {size}", human_size(done));
+            }
+            centered_text(f, body, vec![s]);
+            "Esc close".to_string()
+        }
+        Some(Kind::Text(lines)) => {
+            let h = body.height as usize;
+            p.scroll = p.scroll.min(lines.len().saturating_sub(h));
+            let shown = &lines[p.scroll..(p.scroll + h).min(lines.len())];
+            let shown: Vec<Line> = shown.iter().map(|l| Line::raw(l.as_str())).collect();
+            f.render_widget(Paragraph::new(shown), body);
+            match lines.len() {
+                0 => "empty · Esc close".into(),
+                n => format!(
+                    "lines {}–{} of {n} · ↑↓ PgUp PgDn scroll · Esc close",
+                    p.scroll + 1,
+                    (p.scroll + h).min(n)
+                ),
+            }
+        }
+        Some(Kind::Image(info)) => {
+            if let Some(img) = &mut p.image {
+                draw_image(f, body, img);
+            }
+            format!("{info} · {size} · Esc close")
+        }
+        Some(Kind::Media(probe)) => {
+            let [pic, info] =
+                Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(body);
+            // No picture (audio without cover art): the info line sits mid-body, not under a void.
+            let info = match &mut p.image {
+                Some(img) => {
+                    draw_image(f, pic, img);
+                    info
+                }
+                None => body.centered(Constraint::Fill(1), Constraint::Length(1)),
+            };
+            // Centered only when it fits: a centered cut loses both the codec and the duration.
+            let l = Line::from(probe.info());
+            let l = if l.width() <= info.width as usize {
+                l.centered()
+            } else {
+                l
+            };
+            f.render_widget(l, info);
+            match &p.player {
+                Some(pl) => {
+                    let mut s = format!("▶ {}", fmt_secs(pl.started.elapsed().as_secs_f64()));
+                    if let Some(d) = probe.duration {
+                        s += &format!(" / {}", fmt_secs(d));
+                    }
+                    s + " · Space stop · Esc close"
+                }
+                None if p.no_player => "Install ffmpeg to play · Esc close".into(),
+                None => "Space play · Esc close".into(),
+            }
+        }
+        Some(Kind::Message(m)) => {
+            centered_text(f, body, vec![m.clone(), size]);
+            "Esc close".into()
+        }
+    };
+    f.render_widget(Line::styled(footer, Color::DarkGray), foot);
+    (close, body)
+}
+
+/// Fitted (never enlarged) and centered in `area`.
+fn draw_image(f: &mut Frame, area: Rect, img: &mut StatefulProtocol) {
+    // ponytail: resize + encode run here on the UI thread, a hitch on first show and on each
+    // terminal resize (bounded by preview's 1600 px cap); ratatui-image's ThreadProtocol if it shows.
+    let resize = Resize::Fit(Some(FilterType::Triangle));
+    let s = img.size_for(resize.clone(), area.as_size());
+    let r = area.centered(Constraint::Length(s.width), Constraint::Length(s.height));
+    f.render_stateful_widget(StatefulImage::default().resize(resize), r, img);
+}
+
+/// `lines` wrapped and centered in `area`. The height guess ignores word breaks: text that
+/// wraps early just sits a row lower.
+fn centered_text(f: &mut Frame, area: Rect, lines: Vec<String>) {
+    let w = area.width.max(1) as usize;
+    let n: usize = lines.iter().map(|l| l.width().div_ceil(w).max(1)).sum();
+    let top = area.height.saturating_sub(n as u16) / 2;
+    let r = Rect {
+        y: area.y + top,
+        height: area.height - top,
+        ..area
+    };
+    let lines: Vec<Line> = lines.into_iter().map(Line::from).collect();
+    f.render_widget(
+        Paragraph::new(lines).centered().wrap(Wrap { trim: true }),
+        r,
+    );
 }
 
 const ACCENT: Style = Style::new()
@@ -519,6 +648,7 @@ mod tests {
     use super::*;
     use crate::fs::{Entry, Fs};
     use crate::model::{ConflictPrompt, Drag, InputKind, JobProgress, Pane};
+    use crate::preview::Probe;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -868,6 +998,157 @@ mod tests {
         assert!(!row(&b, yl).contains("txt"), "{}", row(&b, yl));
         assert!(end_of_2k(yl).is_some());
         assert_eq!(end_of_2k(yl), end_of_2k(ys_));
+    }
+
+    fn preview(a: &mut App, kind: Option<Kind>) -> &mut Preview {
+        a.popup = Some(Popup::Preview(Box::new(Preview {
+            name: "clip.mp4".into(),
+            size: 2048,
+            seq: 1,
+            kind,
+            got: None,
+            image: None,
+            scroll: 0,
+            path: None,
+            temp: None,
+            player: None,
+            no_player: false,
+            task: None,
+        })));
+        pv(a)
+    }
+    fn pv(a: &mut App) -> &mut Preview {
+        match &mut a.popup {
+            Some(Popup::Preview(p)) => p,
+            _ => panic!("no preview popup"),
+        }
+    }
+    fn thumb() -> Option<StatefulProtocol> {
+        let img = image::DynamicImage::new_rgb8(40, 30);
+        Some(ratatui_image::picker::Picker::halfblocks().new_resize_protocol(img))
+    }
+    fn probe() -> Probe {
+        Probe {
+            duration: Some(42.0),
+            video: Some(("h264".into(), 320, 240)),
+            ..Probe::default()
+        }
+    }
+    fn text(n: usize) -> Option<Kind> {
+        Some(Kind::Text((0..n).map(|i| format!("line {i}")).collect()))
+    }
+
+    #[test]
+    fn preview_close_mark_is_top_right() {
+        let mut a = app("/d", vec![]);
+        preview(&mut a, text(3));
+        let b = render(&mut a, 80, 24);
+        let ((l, y), w) = popup_top(&b, "clip.mp4");
+        assert!(row(&b, y).contains('✕'), "{}", row(&b, y));
+        let c = a.hit.close;
+        assert_eq!((c.y, c.width), (y, 3));
+        assert_eq!(b[(c.x + 1, c.y)].symbol(), "✕");
+        assert_eq!(c.right(), l + w as u16 - 1); // just left of ┓
+        // A long name keeps its extension and stops short of the ✕.
+        pv(&mut a).name = format!("{}.mp4", "long-name-".repeat(20));
+        let top = row(&render(&mut a, 80, 24), y);
+        assert!(top.contains(" …") && top.contains(".mp4 ━ ✕ ┓"), "{top}");
+    }
+
+    #[test]
+    fn text_preview_scrolls_and_clamps() {
+        let mut a = app("/d", vec![]);
+        preview(&mut a, text(100));
+        let b = render(&mut a, 80, 24);
+        let body = a.hit.preview;
+        assert!(row(&b, body.y).contains("line 0"), "{}", row(&b, body.y));
+        pv(&mut a).scroll = 10;
+        let b = render(&mut a, 80, 24);
+        assert!(row(&b, body.y).contains("line 10"), "{}", row(&b, body.y));
+        pv(&mut a).scroll = usize::MAX;
+        let b = render(&mut a, 80, 24);
+        assert_eq!(pv(&mut a).scroll, 100 - body.height as usize);
+        let foot = row(&b, body.bottom());
+        let want = format!("lines {}–100 of 100", 101 - body.height);
+        assert!(foot.contains(&want), "{foot}");
+        preview(&mut a, text(0));
+        let b = render(&mut a, 80, 24);
+        assert!(row(&b, body.bottom()).contains("empty · Esc close"));
+    }
+
+    #[test]
+    fn image_and_media_previews_draw() {
+        let mut a = app("/d", vec![]);
+        preview(&mut a, Some(Kind::Image("40×30 · PNG".into()))).image = thumb();
+        let b = render(&mut a, 80, 24);
+        let foot = row(&b, a.hit.preview.bottom());
+        assert!(foot.contains("40×30 · PNG · 2K · Esc close"), "{foot}");
+
+        preview(&mut a, Some(Kind::Media(probe()))).image = thumb();
+        let b = render(&mut a, 80, 24);
+        let body = a.hit.preview;
+        let info = row(&b, body.bottom() - 1);
+        assert!(info.contains(&probe().info()), "{info}");
+        assert!(row(&b, body.bottom()).contains("Space play · Esc close"));
+        pv(&mut a).no_player = true;
+        let b = render(&mut a, 80, 24);
+        let foot = row(&b, body.bottom());
+        assert!(
+            foot.contains("Install ffmpeg to play · Esc close"),
+            "{foot}"
+        );
+        // No cover art: the info line moves to the middle of the body.
+        preview(&mut a, Some(Kind::Media(probe())));
+        let b = render(&mut a, 80, 24);
+        let mid = body.y + body.height / 2;
+        assert!(row(&b, mid).contains(&probe().info()), "{}", row(&b, mid));
+
+        preview(
+            &mut a,
+            Some(Kind::Message("No preview for this file type.".into())),
+        );
+        let b = render(&mut a, 80, 24);
+        let text: String = (0..24).map(|y| row(&b, y)).collect();
+        assert!(text.contains("No preview for this file type.") && text.contains("2K"));
+        let p = preview(&mut a, None);
+        (p.got, p.size) = (Some(1024), 4096);
+        let b = render(&mut a, 80, 24);
+        let text: String = (0..24).map(|y| row(&b, y)).collect();
+        assert!(text.contains("Loading… 1K / 4K"), "{text}");
+    }
+
+    #[test]
+    fn tiny_terminal_preview() {
+        for (w, h) in [(20, 6), (1, 1)] {
+            for i in 0..5 {
+                let mut a = app("/d", vec![]);
+                let kind = match i {
+                    0 => None,
+                    1 => text(50),
+                    2 => Some(Kind::Image("40×30 · PNG".into())),
+                    3 => Some(Kind::Media(probe())),
+                    _ => Some(Kind::Message("Can't read: a very long error".into())),
+                };
+                let p = preview(&mut a, kind);
+                p.image = if i == 2 || i == 3 { thumb() } else { None };
+                p.scroll = usize::MAX;
+                render(&mut a, w, h);
+                let c = a.hit.close;
+                assert_eq!(c.intersection(Rect::new(0, 0, w, h)), c, "{w}×{h}");
+                if w == 20 {
+                    assert_eq!(c.width, 3);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn help_mentions_preview() {
+        let mut a = app("/d", vec![]);
+        a.popup = Some(Popup::Help);
+        let b = render(&mut a, 80, 24);
+        let text: String = (0..24).map(|y| row(&b, y)).collect();
+        assert!(text.contains("Open dir / preview file"), "{text}");
     }
 
     #[test]

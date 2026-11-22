@@ -2,6 +2,7 @@ mod controller;
 mod fs;
 mod icons;
 mod model;
+mod preview;
 mod transfer;
 mod view;
 use clap::Parser;
@@ -10,6 +11,7 @@ use fs::{Fs, Remote, SshOpts, sftp_err};
 use model::{App, Pane, Side};
 use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture};
 use ratatui::crossterm::execute;
+use ratatui_image::picker::Picker;
 use std::io::stdout;
 use std::process::ExitCode;
 use std::sync::{Arc, mpsc};
@@ -134,6 +136,27 @@ fn run() -> Result<(), (u8, String)> {
         hook(info);
     }));
     let mut terminal = ratatui::init();
+    // tokio catches panics on its threads (a JoinError its caller reports, e.g. the preview's
+    // `Can't read`); restoring the terminal there would wreck a UI that keeps running.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let main = std::thread::current().name() == Some("main");
+        if main || tokio::runtime::Handle::try_current().is_err() {
+            hook(info);
+        }
+    }));
+    // Writes a query and reads the answer from stdin: before mouse capture and the input thread.
+    // tmux/screen in TERM without TMUX is an ssh hop (passthrough off: nothing answers) or GNU
+    // screen (the graphics escape lands in the title): no query, half blocks.
+    // ponytail: any other terminal that never answers (every real one answers DSR) waits 2 s,
+    // and ratatui-image's query thread, left reading stdin, eats the first key; a flag that
+    // skips the query if such a terminal shows up.
+    let term = std::env::var("TERM").unwrap_or_default();
+    let muxed = term.starts_with("tmux") || term.starts_with("screen");
+    let picker = match muxed && std::env::var_os("TMUX").is_none() {
+        true => Picker::halfblocks(),
+        false => Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()),
+    };
     let _ = execute!(stdout(), EnableMouseCapture);
 
     let (tx, rx) = mpsc::channel();
@@ -149,11 +172,18 @@ fn run() -> Result<(), (u8, String)> {
     let left = Pane::new(lfs, lcwd.clone());
     let right = Pane::new(rfs, rcwd.clone());
     let mut app = App::new(left, right, !cli.no_icons);
+    app.picker = picker;
     let mut ctl = Controller::new(rt.handle().clone(), tx);
     ctl.load(&mut app, Side::Left, lcwd, None);
     ctl.load(&mut app, Side::Right, rcwd, None);
 
     while !app.quit {
+        // Not terminal.clear(): it asks for the cursor position, which waits 2 s on crossterm's
+        // reader that the input thread holds. resize clears the screen and the back buffer.
+        if std::mem::take(&mut app.clear) {
+            let area = terminal.get_frame().area();
+            let _ = terminal.resize(area);
+        }
         if terminal.draw(|f| view::draw(f, &mut app)).is_err() {
             break; // the terminal is gone
         }

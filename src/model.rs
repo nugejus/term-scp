@@ -1,7 +1,10 @@
 use crate::fs::{Entry, Fs, sort_entries};
+use crate::preview::{Kind, Player};
 use crate::transfer::{JobId, Resolution};
 use ratatui::layout::{Position, Rect};
+use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::PathBuf;
 use std::time::Instant;
 use unicode_normalization::UnicodeNormalization;
 
@@ -268,6 +271,29 @@ pub enum Popup {
         at: Position,  // where it was right-clicked
         cursor: usize, // index into MENU
     },
+    Preview(Box<Preview>),
+}
+/// Everything it owns (task, temp file, player) goes with the popup.
+pub struct Preview {
+    pub name: String,
+    pub size: u64,
+    pub seq: u64,
+    pub kind: Option<Kind>, // None while loading
+    pub got: Option<u64>,   // remote download: bytes done (of size)
+    pub image: Option<StatefulProtocol>,
+    pub scroll: usize,
+    pub path: Option<PathBuf>, // the bytes on disk, for ffplay
+    pub temp: Option<tempfile::NamedTempFile>,
+    pub player: Option<Player>,
+    pub no_player: bool, // ffplay failed to spawn
+    pub task: Option<tokio::task::AbortHandle>,
+}
+impl Drop for Preview {
+    fn drop(&mut self) {
+        if let Some(t) = &self.task {
+            t.abort(); // a download in progress stops, and its temp file goes with it
+        }
+    }
 }
 pub struct ConflictPrompt {
     pub job: JobId,
@@ -334,6 +360,8 @@ pub struct Hit {
     pub boxes: [Rect; 2],   // whole pane boxes, border and title included: the drop zones
     pub toolbar: Vec<Rect>, // toolbar[i] <-> TOOLBAR[i]
     pub menu: Rect,         // the open menu's rows: row i <-> MENU[i]
+    pub close: Rect,        // the preview's ✕ cells
+    pub preview: Rect,      // the preview's body; its height is the page size
 }
 pub struct Drag {
     pub from: Side,
@@ -353,6 +381,8 @@ pub struct App {
     pub last_click: Option<(Instant, Side, usize)>,
     pub icons: bool,
     pub count: usize, // digits typed before ↑ / ↓; 0 = none
+    pub picker: Picker,
+    pub clear: bool, // a full redraw before the next frame: image pixels ratatui doesn't track
     pub quit: bool,
 }
 impl App {
@@ -369,6 +399,8 @@ impl App {
             last_click: None,
             icons,
             count: 0,
+            picker: Picker::halfblocks(),
+            clear: false,
             quit: false,
         }
     }

@@ -11,6 +11,8 @@ clap = { version = "4.6", features = ["derive"] }
 unicode-normalization = "0.1.26"
 unicode-width = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-
-[dev-dependencies]
+ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
+# image's default formats minus `avif`, which in 0.25 is only an encoder (rav1e: doubles the
+# build), and without `rayon` (only EXR decodes single-threaded).
+image = { version = "0.25", default-features = false, features = ["bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
 tempfile = "3.27"

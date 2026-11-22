@@ -12,6 +12,7 @@ Two-pane file manager for the terminal: your machine on the left, an SSH host on
 - Rust 1.88+
 - OpenSSH `ssh` on your `PATH`, and SFTP enabled on the host (it is by default)
 - A Nerd Font in your terminal for the file icons, or `--no-icons`
+- Optional: `ffmpeg`, with its `ffprobe` and `ffplay`, on your `PATH` for audio and video previews
 
 ## Installation
 
@@ -68,7 +69,7 @@ With two hosts, `-P`, `-i` and `-o` apply to both; put anything for one host onl
 | `PgUp` / `PgDn`             | Page up / down                           |
 | `Home` / `End`              | First / last file                        |
 | `Backspace`                 | Parent folder                            |
-| `Enter`                     | Open the folder                          |
+| `Enter`                     | Open the folder, or preview the file (see [Preview](#preview)) |
 | `←` / `→`                   | Left / right pane                        |
 | `Tab`                       | Switch pane                              |
 | `Esc`                       | Clear the marks                          |
@@ -89,13 +90,25 @@ The selection is the marked files, or the file under the cursor when nothing is 
 - Moving the cursor without `Shift` (`↑` / `↓`, `PgUp` / `PgDn`, `Home` / `End`) clears the marks, and so does opening another folder. A copy and `Ctrl` `R` keep them.
 - The bottom line shows how many files are marked in the focused pane and their size (folders not counted), and the last message or error. The next key clears the message.
 
-The toolbar buttons do what their keys do. Everything is also clickable; double-click opens a folder, and the wheel moves the cursor in the pane under the pointer without focusing it. Drag a file onto the other pane to copy it into that pane's folder, or onto a folder row other than `..` to copy into that folder. Its dimmed name follows the pointer. Dragging a marked file takes all marked files.
+The toolbar buttons do what their keys do. Everything is also clickable; double-click opens a folder or previews a file, and the wheel moves the cursor in the pane under the pointer without focusing it. Drag a file onto the other pane to copy it into that pane's folder, or onto a folder row other than `..` to copy into that folder. Its dimmed name follows the pointer. Dragging a marked file takes all marked files.
 
 Right-click a file for a menu: copy, copy to, move, rename, delete, new folder, new file, change folder and filter, each with its key beside it. It acts on that file, or on all marked files when it is one of them. Pick with the mouse, `↑` `↓` `Enter` or the key; `Esc` or a click elsewhere closes it. Some terminals keep right-click for their own menu; turn that off to get this one.
 
 <p align="center">
   <img src="docs/screenshots/menu.png" width="760" alt="The right-click menu open over two marked files, listing Copy, Copy to, Move to, Rename, Delete, New dir, New file, Change dir and Filter, each with its key">
 </p>
+
+## Preview
+
+`Enter` or a double-click on a file opens a popup that shows what it is, so you can tell before copying it. `Esc` or a click on the `✕` at its top right closes it. What a file is goes by its bytes, not its name.
+- Text: the lines, cut at the popup's width; `↑` `↓` `PgUp` `PgDn` `Home` `End` and the wheel scroll.
+- Images (PNG, JPEG, GIF, WebP, …): the picture, its size and format. Ghostty, kitty, iTerm2, WezTerm and sixel terminals show the real picture; other terminals show it in half blocks.
+- Audio and video: the duration, codecs, resolution or sample rate, and a frame of the video or its cover art. `Space` plays it with `ffplay` and `Space` again stops it. Audio plays behind the popup; a video opens in ffplay's own window. Closing the popup stops it.
+- Anything else: `No preview for this file type.`
+
+A file on the host is downloaded to a temp file first, with its progress shown, and the temp file is removed when the popup closes. Files over 50 MB on the host aren't downloaded, and local text and images over 50 MB aren't read: both show `Too big to preview (over 50 MB).` Local audio and video play at any size.
+
+`ffmpeg` is optional (`brew install ffmpeg`, `apt install ffmpeg`). Without it, text and images still preview; audio and video show `Audio/video preview needs ffmpeg.`
 
 ## Copy to and Move
 
@@ -160,6 +173,6 @@ term-scp runs your `ssh`, so `~/.ssh/config`, the agent and `known_hosts` apply 
 
 ## Not yet
 
-- Opening or editing files
+- Editing files, or opening them in another app
 - Cancelling a single transfer. Quitting cancels all of them and leaves their `.term-scp-part` files behind.
 - Dropping files in from Finder, or pasting. Don't: the text arrives as keys, so a `c` in it starts a copy and a `q` quits.

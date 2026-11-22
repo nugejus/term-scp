@@ -1,15 +1,20 @@
 use crate::fs::{Entry, Fs, join, parent, resolve_path};
 use crate::model::{
-    App, Command, ConflictPrompt, Drag, InputKind, JobProgress, MENU, Popup, Side, TOOLBAR,
+    App, Command, ConflictPrompt, Drag, InputKind, JobProgress, MENU, Popup, Preview, Side, TOOLBAR,
 };
+use crate::preview::{Kind, LIMIT, Loaded, NO_PREVIEW, Player, TOO_BIG, load};
 use crate::transfer::{self, Emit, Job, JobId, Resolution, TransferEvent};
 use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Position;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
+use tempfile::NamedTempFile;
+use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
 
 pub enum AppEvent {
@@ -26,6 +31,16 @@ pub enum AppEvent {
         result: Result<(), String>,
     },
     Transfer(TransferEvent),
+    PreviewProgress {
+        seq: u64,
+        done: u64,
+    },
+    Previewed {
+        seq: u64,
+        loaded: Loaded,
+        path: PathBuf,
+        temp: Option<NamedTempFile>,
+    },
 }
 
 /// The Key table. Letters match regardless of SHIFT; Ctrl+letter is only Ctrl+R and Ctrl+C.
@@ -112,11 +127,41 @@ fn under(app: &App, pos: Position) -> Option<(Side, Option<usize>)> {
     Some((s, (i < p.entries.len()).then_some(i)))
 }
 
+/// A remote file into a temp file of the same extension, reporting bytes done as it goes.
+async fn download(
+    fs: &Fs,
+    path: &str,
+    seq: u64,
+    tx: &Sender<AppEvent>,
+) -> Result<NamedTempFile, String> {
+    let ext = Path::new(path).extension();
+    let suffix = ext.map_or(String::new(), |x| format!(".{}", x.to_string_lossy()));
+    let mut temp = tempfile::Builder::new()
+        .prefix("term-scp-preview-")
+        .suffix(&suffix)
+        .tempfile()
+        .map_err(|e| e.to_string())?;
+    // Caps a file that grew after it was listed; the preview then shows its first LIMIT bytes.
+    let mut r = fs.open_read(path).await?.take(LIMIT);
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut done = 0;
+    loop {
+        let n = r.read(&mut buf).await.map_err(|e| format!("{path}: {e}"))?;
+        if n == 0 {
+            return Ok(temp);
+        }
+        temp.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        done += n as u64;
+        let _ = tx.send(AppEvent::PreviewProgress { seq, done });
+    }
+}
+
 pub struct Controller {
     rt: tokio::runtime::Handle,
     tx: Sender<AppEvent>,
     sem: Arc<Semaphore>,
     next_job: JobId,
+    next_preview: u64,
 }
 
 impl Controller {
@@ -126,6 +171,7 @@ impl Controller {
             tx,
             sem: Arc::new(Semaphore::new(4)),
             next_job: 1,
+            next_preview: 0,
         }
     }
 
@@ -193,6 +239,29 @@ impl Controller {
                 }
             }
             AppEvent::Transfer(t) => self.on_transfer(app, t),
+            // Only for the open preview: anything else is late, and drops (with its temp file).
+            AppEvent::PreviewProgress { seq, done } => {
+                if let Some(Popup::Preview(p)) = &mut app.popup
+                    && p.seq == seq
+                    && let Some(got) = &mut p.got
+                {
+                    *got = done;
+                }
+            }
+            AppEvent::Previewed {
+                seq,
+                loaded,
+                path,
+                temp,
+            } => {
+                if let Some(Popup::Preview(p)) = &mut app.popup
+                    && p.seq == seq
+                {
+                    p.kind = Some(loaded.kind);
+                    p.image = loaded.image.map(|i| app.picker.new_resize_protocol(i));
+                    (p.path, p.temp, p.got) = (Some(path), temp, None);
+                }
+            }
         }
     }
 
@@ -242,6 +311,35 @@ impl Controller {
                 });
             }
             Some(Popup::Help) => {}
+            // Every key is the preview's: none reaches the panes.
+            Some(Popup::Preview(mut p)) => {
+                let page = app.hit.preview.height.max(1) as usize;
+                match k.code {
+                    KeyCode::Esc => {
+                        app.clear = true; // sixel/iTerm2 pixels outlive their cells
+                        return;
+                    }
+                    KeyCode::Char(' ') => {
+                        if let (Some(Kind::Media(probe)), Some(path)) = (&p.kind, &p.path)
+                            && p.player.take().is_none()
+                        {
+                            match Player::spawn(path, probe, &p.name) {
+                                Ok(pl) => p.player = Some(pl),
+                                Err(_) => p.no_player = true,
+                            }
+                        }
+                    }
+                    // The view clamps.
+                    KeyCode::Up => p.scroll = p.scroll.saturating_sub(1),
+                    KeyCode::Down => p.scroll = p.scroll.saturating_add(1),
+                    KeyCode::PageUp => p.scroll = p.scroll.saturating_sub(page),
+                    KeyCode::PageDown => p.scroll = p.scroll.saturating_add(page),
+                    KeyCode::Home => p.scroll = 0,
+                    KeyCode::End => p.scroll = usize::MAX,
+                    _ => {}
+                }
+                app.popup = Some(Popup::Preview(p));
+            }
             Some(Popup::Menu { at, cursor }) => match k.code {
                 KeyCode::Up | KeyCode::Down => {
                     let cursor = match k.code {
@@ -326,6 +424,19 @@ impl Controller {
                 }
                 _ => {}
             }
+        }
+        if let Some(Popup::Preview(p)) = &mut app.popup {
+            let over = app.hit.preview.contains(pos);
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) if app.hit.close.contains(pos) => {
+                    app.popup = None;
+                    app.clear = true;
+                }
+                MouseEventKind::ScrollUp if over => p.scroll = p.scroll.saturating_sub(3),
+                MouseEventKind::ScrollDown if over => p.scroll = p.scroll.saturating_add(3),
+                _ => {}
+            }
+            return;
         }
         if app.popup.is_some() || !app.conflicts.is_empty() {
             return;
@@ -498,7 +609,11 @@ impl Controller {
                     let path = join(&p.cwd, &e.name);
                     self.load(app, side, path, None);
                 }
-                _ => {}
+                Some(e) => {
+                    let e = e.clone();
+                    self.preview(app, side, e);
+                }
+                None => {}
             },
             Parent => {
                 if let Some((dir, name)) = parent(&p.cwd) {
@@ -567,6 +682,68 @@ impl Controller {
             Quit if app.transfers.jobs.is_empty() => app.quit = true,
             Quit => app.popup = Some(Popup::ConfirmQuit),
         }
+    }
+
+    /// Opens the popup, Loading, and starts the task that fills it. Remote files are downloaded
+    /// to a temp file first; one over LIMIT or not a regular file isn't, and gets its message at once.
+    fn preview(&mut self, app: &mut App, side: Side, e: Entry) {
+        self.next_preview += 1;
+        let (seq, tx) = (self.next_preview, self.tx.clone());
+        let pane = &app.panes[side.idx()];
+        let (fs, path) = (pane.fs.clone(), join(&pane.cwd, &e.name));
+        let (remote, regular) = (matches!(fs, Fs::Remote(_)), e.is_regular());
+        let mut p = Preview {
+            name: e.name,
+            size: e.size,
+            seq,
+            kind: None,
+            got: remote.then_some(0),
+            image: None,
+            scroll: 0,
+            path: None,
+            temp: None,
+            player: None,
+            no_player: false,
+            task: None,
+        };
+        // A device or FIFO would read forever; load() guards the local side.
+        if remote && (!regular || e.size > LIMIT) {
+            let m = if regular { TOO_BIG } else { NO_PREVIEW };
+            (p.kind, p.got) = (Some(Kind::Message(m.into())), None);
+        } else {
+            let task = self.rt.spawn(async move {
+                let file = match remote {
+                    true => download(&fs, &path, seq, &tx)
+                        .await
+                        .map(|t| (t.path().into(), Some(t))),
+                    false => Ok((PathBuf::from(path), None)),
+                };
+                let (loaded, path, temp) = match file {
+                    Ok((path, temp)) => {
+                        let at = path.clone();
+                        let loaded = tokio::task::spawn_blocking(move || load(&at))
+                            .await
+                            .unwrap_or_else(|e| Loaded {
+                                kind: Kind::Message(format!("Can't read: {e}")), // load panicked
+                                image: None,
+                            });
+                        (loaded, path, temp)
+                    }
+                    Err(e) => {
+                        let kind = Kind::Message(format!("Can't read: {e}"));
+                        (Loaded { kind, image: None }, PathBuf::new(), None)
+                    }
+                };
+                let _ = tx.send(AppEvent::Previewed {
+                    seq,
+                    loaded,
+                    path,
+                    temp,
+                });
+            });
+            p.task = Some(task.abort_handle());
+        }
+        app.popup = Some(Popup::Preview(Box::new(p)));
     }
 
     /// A one-off fs call; its OpDone reloads `side` with the cursor on `select`.
@@ -705,6 +882,11 @@ impl Controller {
 
     pub fn tick(&mut self, app: &mut App, now: Instant) {
         app.transfers.sample(now);
+        if let Some(Popup::Preview(p)) = &mut app.popup
+            && p.player.as_mut().is_some_and(|pl| pl.finished())
+        {
+            p.player = None; // ffplay ended on its own: the footer goes back to Space play
+        }
         for p in &app.panes {
             if let Fs::Remote(r) = &p.fs
                 && let Some(line) = r.take_new_stderr()
@@ -718,7 +900,8 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Pane;
+    use crate::model::{Pane, Preview};
+    use crate::preview::LIMIT;
     use Side::*;
     use std::sync::mpsc::Receiver;
 
@@ -1643,6 +1826,190 @@ mod tests {
         down(&mut t, a);
         assert_eq!(t.app.focus, Left);
         assert!(t.app.drag.is_none());
+    }
+
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(w, h)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+    /// Writes `name` into `side`'s dir and waits for the pane to list it, the cursor on it.
+    fn put(t: &mut T, side: Side, name: &str, bytes: &[u8]) {
+        let dir = t.dirs[side.idx()].clone();
+        std::fs::write(join(&dir, name), bytes).unwrap();
+        t.ctl.load(&mut t.app, side, dir, Some(name.into()));
+        pump(t, |a| lists(a, side, &[name]));
+    }
+    fn pv(a: &App) -> &Preview {
+        match &a.popup {
+            Some(Popup::Preview(p)) => p,
+            _ => panic!("no preview popup"),
+        }
+    }
+    fn text(lines: &[&str]) -> Option<Kind> {
+        Some(Kind::Text(lines.iter().map(|l| l.to_string()).collect()))
+    }
+
+    #[test]
+    fn enter_on_a_file_previews_it() {
+        let mut t = setup(&["sub/"], &[]);
+        put(&mut t, Left, "notes.txt", b"one\ntwo\n");
+        press(&mut t, KeyCode::Enter);
+        assert_eq!(pv(&t.app).kind, None);
+        pump(&mut t, |a| pv(a).kind.is_some());
+        assert_eq!(pv(&t.app).kind, text(&["one", "two"]));
+        press(&mut t, KeyCode::Esc);
+        select(&mut t, "sub");
+        press(&mut t, KeyCode::Enter);
+        pump(&mut t, |a| a.panes[0].cwd.ends_with("/sub"));
+    }
+
+    #[test]
+    fn preview_swallows_keys_and_esc_closes() {
+        let mut t = setup(&[], &[]);
+        put(&mut t, Left, "notes.txt", b"one\ntwo\n");
+        press(&mut t, KeyCode::Enter);
+        pump(&mut t, |a| pv(a).kind.is_some());
+        typ(&mut t, "dcq5");
+        press(&mut t, KeyCode::Down);
+        assert_eq!(pv(&t.app).scroll, 1); // still the preview: no ConfirmDelete either
+        assert!(!t.app.quit && t.app.count == 0 && t.app.transfers.jobs.is_empty());
+        press(&mut t, KeyCode::Esc);
+        assert!(t.app.popup.is_none() && t.app.clear);
+    }
+
+    #[test]
+    fn click_on_close_and_double_click() {
+        let mut t = setup(&[], &[]);
+        put(&mut t, Left, "notes.txt", b"one\n");
+        draw(&mut t);
+        press(&mut t, KeyCode::Enter);
+        t.app.hit.close = ratatui::layout::Rect::new(10, 2, 3, 1); // no draw after: it resets
+        down(&mut t, (11, 2));
+        assert!(t.app.popup.is_none());
+        let n = at(&t, Left, "notes.txt");
+        down(&mut t, n);
+        assert!(t.app.popup.is_none(), "single click only selects");
+        down(&mut t, n);
+        assert!(matches!(t.app.popup, Some(Popup::Preview(_))));
+    }
+
+    #[test]
+    fn late_result_is_dropped() {
+        let mut t = setup(&[], &[]);
+        put(&mut t, Left, "notes.txt", b"one\n");
+        press(&mut t, KeyCode::Enter);
+        let first = pv(&t.app).seq;
+        press(&mut t, KeyCode::Esc);
+        press(&mut t, KeyCode::Enter);
+        let second = pv(&t.app).seq;
+        assert_ne!(first, second);
+        let loaded = Loaded {
+            kind: Kind::Text(vec!["stale".into()]),
+            image: None,
+        };
+        let (path, temp) = ("/stale".into(), None);
+        let late = AppEvent::Previewed {
+            seq: first,
+            loaded,
+            path,
+            temp,
+        };
+        t.ctl.handle(&mut t.app, late);
+        assert_eq!((pv(&t.app).seq, &pv(&t.app).kind), (second, &None));
+        pump(&mut t, |a| pv(a).kind.is_some());
+        assert_eq!(pv(&t.app).kind, text(&["one"]));
+    }
+
+    #[test]
+    fn remote_preview_uses_and_removes_a_temp_file() {
+        let mut t = setup(&[], &[]);
+        let fs = t._rt.block_on(crate::fs::test_remote());
+        t.app.panes[1] = Pane::new(fs, t.dirs[1].clone());
+        put(&mut t, Right, "pic.png", &png(40, 30));
+        press(&mut t, KeyCode::Right);
+        press(&mut t, KeyCode::Enter);
+        pump(&mut t, |a| pv(a).kind.is_some());
+        assert!(matches!(pv(&t.app).kind, Some(Kind::Image(_))));
+        let temp = pv(&t.app).temp.as_ref().unwrap().path().to_owned();
+        let name = temp.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("term-scp-preview-") && name.ends_with(".png"));
+        assert!(temp.exists());
+        press(&mut t, KeyCode::Esc);
+        assert!(!temp.exists());
+
+        // Closed mid-download: the task stops and takes its temp file with it.
+        let left_over = || {
+            std::fs::read_dir(std::env::temp_dir()).unwrap().any(|e| {
+                let n = e.unwrap().file_name().to_string_lossy().into_owned();
+                n.starts_with("term-scp-preview-") && n.ends_with(".t3abort")
+            })
+        };
+        put(&mut t, Right, "big.t3abort", &vec![b'x'; 4 << 20]);
+        press(&mut t, KeyCode::Enter);
+        pump(&mut t, |a| pv(a).got.is_some_and(|done| done > 0));
+        assert!(left_over());
+        press(&mut t, KeyCode::Esc);
+        let end = Instant::now() + Duration::from_millis(500);
+        while let Some(left) = end.checked_duration_since(Instant::now()) {
+            if let Ok(ev) = t.rx.recv_timeout(left) {
+                t.ctl.handle(&mut t.app, ev); // a late Previewed holds its temp file until here
+            }
+        }
+        assert!(!left_over());
+    }
+
+    #[test]
+    fn closing_a_preview_aborts_its_task() {
+        // The test above can't tell: a download that ran on sends a late Previewed, which drops.
+        let mut t = setup(&[], &[]);
+        put(&mut t, Left, "notes.txt", b"one\n");
+        press(&mut t, KeyCode::Enter);
+        let stuck = t._rt.spawn(std::future::pending::<()>()).abort_handle();
+        let Some(Popup::Preview(p)) = &mut t.app.popup else {
+            panic!("no preview popup")
+        };
+        p.task = Some(stuck.clone());
+        press(&mut t, KeyCode::Esc);
+        let end = Instant::now() + Duration::from_secs(5);
+        while !stuck.is_finished() {
+            assert!(Instant::now() < end, "the task still runs");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn remote_over_limit_is_not_downloaded() {
+        let mut t = setup(&[], &[]);
+        let (fs, cwd) = (t._rt.block_on(crate::fs::test_remote()), t.dirs[1].clone());
+        t.app.panes[1] = Pane::new(fs, cwd.clone());
+        let huge = Entry {
+            size: LIMIT + 1,
+            ..file("huge.bin")
+        };
+        t.app.panes[1].set_listing(cwd, vec![huge], Some("huge.bin"));
+        press(&mut t, KeyCode::Right);
+        press(&mut t, KeyCode::Enter);
+        assert_eq!(pv(&t.app).kind, Some(Kind::Message(TOO_BIG.into())));
+        assert!(pv(&t.app).task.is_none());
+    }
+
+    #[test]
+    fn remote_device_is_not_downloaded() {
+        let mut t = setup(&[], &[]);
+        let (fs, cwd) = (t._rt.block_on(crate::fs::test_remote()), t.dirs[1].clone());
+        t.app.panes[1] = Pane::new(fs, cwd.clone());
+        let zero = Entry {
+            mode: 0o020666, // a char device, size 0, like /dev/zero
+            ..file("zero")
+        };
+        t.app.panes[1].set_listing(cwd, vec![zero], Some("zero"));
+        press(&mut t, KeyCode::Right);
+        press(&mut t, KeyCode::Enter);
+        assert_eq!(pv(&t.app).kind, Some(Kind::Message(NO_PREVIEW.into())));
+        assert!(pv(&t.app).task.is_none());
     }
 
     #[test]
